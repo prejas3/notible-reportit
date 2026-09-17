@@ -521,7 +521,8 @@ async function loadImages(context, refs, onProgress, alive) {
 
 function typeLabel(type) {
   const raw = String(type ?? "note");
-  return raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw;
+  const bare = (raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw).replaceAll("_", " ");
+  return bare.charAt(0).toUpperCase() + bare.slice(1);
 }
 
 function formatDate(date) {
@@ -739,13 +740,20 @@ function mountSurface(context, { container }) {
     footerFields.append(el("h3", { className: "reportit-col-head", textContent: "Page footer (optional)" }));
     const footerNoteInput = el("input", { className: "reportit-title-input", type: "text", placeholder: "Footer note, e.g. Confidential", value: typeof mem.footerNote === "string" ? mem.footerNote : "" });
     footerNoteInput.addEventListener("input", saveMemory);
-    const logoInput = el("input", { className: "reportit-logo-input", type: "file", accept: "image/png,image/jpeg,image/webp,image/gif" });
+    // Native file inputs render their button/status text in the OS UI language,
+    // not the app's — hide it and drive the visible text ourselves so it stays
+    // in the app's chosen language regardless of Windows locale.
+    const logoInput = el("input", { className: "reportit-logo-input-native", type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
+    const logoChoose = el("button", { type: "button", className: "reportit-bulk", textContent: "Choose file" });
+    const logoStatus = el("span", { className: "reportit-logo-status", textContent: "No file chosen" });
     const logoPreview = el("img", { className: "reportit-logo-preview", alt: "", hidden: true });
     const logoClear = el("button", { type: "button", className: "reportit-bulk", textContent: "Remove logo", hidden: true });
+    logoChoose.addEventListener("click", () => logoInput.click());
     const syncLogo = () => {
       logoPreview.hidden = !footerLogoUri;
       if (footerLogoUri) logoPreview.src = footerLogoUri;
       logoClear.hidden = !footerLogoUri;
+      logoStatus.textContent = footerLogoUri ? "Logo selected" : "No file chosen";
     };
     logoInput.addEventListener("change", () => {
       const file = logoInput.files && logoInput.files[0];
@@ -758,7 +766,7 @@ function mountSurface(context, { container }) {
       reader.readAsDataURL(file);
     });
     logoClear.addEventListener("click", () => { footerLogoUri = ""; saveMemory(); syncLogo(); });
-    footerFields.append(footerNoteInput, el("div", { className: "reportit-logo-row" }, [logoInput, logoPreview, logoClear]));
+    footerFields.append(footerNoteInput, el("div", { className: "reportit-logo-row" }, [logoInput, logoChoose, logoStatus, logoPreview, logoClear]));
     pickCol.append(footerFields);
     syncLogo();
     const pickList = el("div", { className: "reportit-list reportit-picklist" });
@@ -779,15 +787,30 @@ function mountSurface(context, { container }) {
       renderPicks();
     };
 
-    // pointer-drag reorder (HTML5 DnD is dead in the Tauri webview)
-    let drag = null;
+    // pointer-drag reorder (HTML5 DnD is dead in the Tauri webview). The grip
+    // is the only control shown at rest — Move up/down stay in the DOM for
+    // keyboard and screen-reader users (self-check asserts they exist; a
+    // drag gesture alone is not operable without a pointer) but are visually
+    // hidden until the row is hovered or a control inside it has focus, via
+    // CSS (`:hover`/`:focus-within`), so the default row reads as just the
+    // grip instead of grip-plus-two-arrow-buttons.
+    let drag = null; // { id, startClientY, deltaY } while a grip drag is live
+    const reduceMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
     function renderPicks() {
+      // FLIP: capture every row's position before the rebuild below replaces
+      // them, keyed by object id (index shifts on every reorder, id does not).
+      const oldRects = new Map();
+      for (const row of pickList.children) {
+        if (row.dataset && row.dataset.id) oldRects.set(row.dataset.id, row.getBoundingClientRect());
+      }
       pickList.replaceChildren();
       selectedIds.forEach((id, index) => {
         const o = byId.get(id);
         if (!o) return;
         const row = el("div", { className: "reportit-pickrow" });
         row.dataset.index = String(index);
+        row.dataset.id = id;
         const upBtn = el("button", { type: "button", className: "reportit-move", textContent: "▲", title: "Move up" });
         upBtn.disabled = index === 0;
         upBtn.addEventListener("click", () => movePick(index, index - 1));
@@ -798,27 +821,46 @@ function mountSurface(context, { container }) {
         grip.addEventListener("pointerdown", (event) => {
           if (event.button !== 0) return;
           event.preventDefault();
-          drag = { from: index };
+          drag = { id, startClientY: event.clientY, deltaY: 0 };
           row.dataset.dragging = "yes";
+          // Hit-testing under the pointer would otherwise keep resolving to
+          // the dragged row itself once it starts following the cursor.
+          row.style.pointerEvents = "none";
           const move = (moveEvent) => {
-            const over = moveEvent.target instanceof Element ? moveEvent.target.closest(".reportit-pickrow") : null;
-            for (const r of pickList.children) delete r.dataset.dropTarget;
-            if (over && over !== row) over.dataset.dropTarget = "yes";
+            if (!drag) return;
+            drag.deltaY = moveEvent.clientY - drag.startClientY;
+            const current = [...pickList.children].find((r) => r.dataset.id === drag.id);
+            if (current) {
+              current.style.transition = "none";
+              current.style.transform = `translateY(${drag.deltaY}px)`;
+            }
+            const overEl = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
+            const over = overEl instanceof Element ? overEl.closest(".reportit-pickrow") : null;
+            if (over && over.dataset.id && over.dataset.id !== drag.id) {
+              const from = selectedIds.indexOf(drag.id);
+              const to = selectedIds.indexOf(over.dataset.id);
+              if (from >= 0 && to >= 0 && from !== to) {
+                const [moved] = selectedIds.splice(from, 1);
+                selectedIds.splice(to, 0, moved);
+                // Re-render now, live, so the other rows visibly slide out of
+                // the way as the pointer passes over them, not just on drop.
+                renderPicks();
+              }
+            }
           };
-          const up = (upEvent) => {
+          const up = () => {
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
-            delete row.dataset.dragging;
-            const over = upEvent.target instanceof Element ? upEvent.target.closest(".reportit-pickrow") : null;
-            if (over && over !== row) {
-              const to = Number(over.dataset.index);
-              const [moved] = selectedIds.splice(drag.from, 1);
-              selectedIds.splice(to, 0, moved);
-              renderPicks();
-            } else {
-              for (const r of pickList.children) delete r.dataset.dropTarget;
-            }
+            const finishedId = drag ? drag.id : null;
             drag = null;
+            const finished = finishedId ? [...pickList.children].find((r) => r.dataset.id === finishedId) : null;
+            if (finished) {
+              delete finished.dataset.dragging;
+              finished.style.pointerEvents = "";
+              finished.style.transition = reduceMotion ? "none" : "transform 140ms cubic-bezier(.2, .8, .2, 1)";
+              finished.style.transform = "";
+            }
+            saveMemory();
           };
           window.addEventListener("pointermove", move);
           window.addEventListener("pointerup", up);
@@ -834,9 +876,41 @@ function mountSurface(context, { container }) {
         pickList.append(row);
       });
       if (!selectedIds.length) pickList.append(el("p", { className: "rp-note", textContent: "Tick objects on the left, or use “Add all matching”." }));
-      pickCount.textContent = selectedIds.length ? `${selectedIds.length}` : "";
+      pickCount.textContent = `${selectedIds.length} of ${pool.length}`;
       updateGenerateEnabled();
       saveMemory();
+
+      // FLIP playback: every row except the one a drag is actively driving
+      // (that one is following the pointer via its own transform above)
+      // animates from where it used to be to where the rebuild just put it.
+      if (!reduceMotion) {
+        for (const row of pickList.children) {
+          const id = row.dataset.id;
+          if (!id || (drag && drag.id === id)) continue;
+          const oldRect = oldRects.get(id);
+          if (!oldRect) continue;
+          const newRect = row.getBoundingClientRect();
+          const deltaY = oldRect.top - newRect.top;
+          if (Math.abs(deltaY) < 0.5) continue;
+          row.style.transition = "none";
+          row.style.transform = `translateY(${deltaY}px)`;
+          requestAnimationFrame(() => {
+            row.style.transition = "transform 180ms cubic-bezier(.2, .8, .2, 1)";
+            row.style.transform = "";
+          });
+        }
+      }
+      // A drag in progress survives the rebuild above as a fresh DOM node —
+      // reapply the dragging state and the pointer-driven transform to it.
+      if (drag) {
+        const row = [...pickList.children].find((r) => r.dataset.id === drag.id);
+        if (row) {
+          row.dataset.dragging = "yes";
+          row.style.pointerEvents = "none";
+          row.style.transition = "none";
+          row.style.transform = `translateY(${drag.deltaY}px)`;
+        }
+      }
     }
 
     // --- generate
@@ -950,7 +1024,15 @@ const styles = `
 .reportit-bulk { border: 1px solid var(--notible-border); border-radius: 7px; background: transparent; color: var(--notible-muted); font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; }
 .reportit-bulk:hover:not(:disabled) { background: var(--notible-hover); }
 .reportit-bulk:disabled { opacity: .45; cursor: default; }
-.reportit-move { flex: none; border: 0; background: none; color: var(--notible-muted); cursor: pointer; font-size: 10px; line-height: 1; padding: 2px 3px; }
+/* Hidden at rest so the row reads as just the drag grip; revealed on hover
+   or once a control inside the row has focus, so Tab still reaches (and
+   shows) these for keyboard/screen-reader users who cannot drag. The
+   :disabled rule comes last so it still wins over the reveal — a disabled
+   arrow at either end of the list stays visibly dim rather than snapping to
+   full strength just because the row is hovered. */
+.reportit-move { flex: none; border: 0; background: none; color: var(--notible-muted); cursor: pointer; font-size: 10px; line-height: 1; padding: 2px 3px; opacity: 0; transition: opacity 120ms ease; }
+.reportit-pickrow:hover .reportit-move,
+.reportit-pickrow:focus-within .reportit-move { opacity: 1; }
 .reportit-move:disabled { opacity: .3; cursor: default; }
 .reportit-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .reportit-typechips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -966,8 +1048,10 @@ const styles = `
 .reportit-poolrow-type, .reportit-pickrow-type { flex: none; color: var(--notible-faint); font-size: 11px; }
 .reportit-pickrow { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; background: transparent; }
 .reportit-pickrow:hover { background: var(--notible-hover); }
-.reportit-pickrow[data-dragging="yes"] { opacity: .5; }
-.reportit-pickrow[data-drop-target="yes"] { box-shadow: inset 0 2px 0 var(--notible-accent); }
+/* The lifted card the pointer is carrying — opaque and raised, not dimmed,
+   since it is now following the cursor rather than sitting in place while a
+   drop target is marked elsewhere (the old design). */
+.reportit-pickrow[data-dragging="yes"] { position: relative; z-index: 5; background: var(--notible-surface); box-shadow: 0 8px 20px rgba(0, 0, 0, .18); cursor: grabbing; }
 .reportit-pickrow-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reportit-grip { flex: none; border: 0; background: none; color: var(--notible-muted); cursor: grab; font-size: 13px; padding: 2px 4px; }
 .reportit-remove { flex: none; border: 0; background: none; color: var(--notible-faint); cursor: pointer; font-size: 14px; padding: 2px 6px; }
@@ -977,7 +1061,7 @@ const styles = `
 .reportit-edit { border: 1px solid var(--notible-border); border-radius: 7px; background: transparent; color: var(--notible-muted); font: inherit; font-size: 12px; padding: 6px 12px; cursor: pointer; }
 .reportit-footer-fields { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; border-top: 1px solid var(--notible-border-subtle, var(--notible-border)); padding-top: 8px; }
 .reportit-logo-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.reportit-logo-input { font: inherit; font-size: 11px; color: var(--notible-muted); }
+.reportit-logo-status { font-size: 11px; color: var(--notible-muted); }
 .reportit-logo-preview { max-height: 26px; max-width: 90px; object-fit: contain; border: 1px solid var(--notible-border-subtle, var(--notible-border)); border-radius: 4px; }
 .reportit-preview-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .reportit-preview-bar { display: flex; gap: 10px; align-items: center; }
@@ -1048,7 +1132,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.4",
+    version: "0.1.6",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",
