@@ -794,15 +794,34 @@ function mountSurface(context, { container }) {
     // hidden until the row is hovered or a control inside it has focus, via
     // CSS (`:hover`/`:focus-within`), so the default row reads as just the
     // grip instead of grip-plus-two-arrow-buttons.
-    let drag = null; // { id, startClientY, deltaY } while a grip drag is live
+    //
+    // Reorder is "shift to make room, commit on drop" (the Trello/dnd-kit
+    // pattern), not "re-render the whole list on every pixel". An earlier
+    // version spliced `selectedIds` and called a full `renderPicks()` on
+    // every row the pointer crossed — tearing down and recreating every row
+    // (fresh elements, fresh listeners) several times a second, with a FLIP
+    // animation racing to catch up on each one. That read as ghosting and
+    // jitter, because it was: overlapping, restarted transitions on
+    // continuously-replaced DOM nodes. Now: `selectedIds` is untouched, and
+    // the DOM is untouched, until the pointer is released. While dragging,
+    // the only thing that changes is `transform` on existing rows: the
+    // dragged one tracks the pointer directly, the rows it has crossed shift
+    // by exactly one slot to preview the gap. One cheap style write per
+    // move, no rebuild, no listener churn, nothing to race.
     const reduceMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-    function renderPicks() {
+    function renderPicks({ animate = true } = {}) {
       // FLIP: capture every row's position before the rebuild below replaces
-      // them, keyed by object id (index shifts on every reorder, id does not).
-      const oldRects = new Map();
-      for (const row of pickList.children) {
-        if (row.dataset && row.dataset.id) oldRects.set(row.dataset.id, row.getBoundingClientRect());
+      // them, keyed by object id (index shifts on every reorder, id does
+      // not). Skipped right after a drag commits — the live shift preview
+      // already showed each row exactly where the rebuild is about to put
+      // it, so animating "from" the pre-drag position would jump backwards
+      // first.
+      const oldRects = animate ? new Map() : null;
+      if (oldRects) {
+        for (const row of pickList.children) {
+          if (row.dataset && row.dataset.id) oldRects.set(row.dataset.id, row.getBoundingClientRect());
+        }
       }
       pickList.replaceChildren();
       selectedIds.forEach((id, index) => {
@@ -821,45 +840,52 @@ function mountSurface(context, { container }) {
         grip.addEventListener("pointerdown", (event) => {
           if (event.button !== 0) return;
           event.preventDefault();
-          drag = { id, startClientY: event.clientY, deltaY: 0 };
+          // A snapshot: the order at the moment the drag starts. It never
+          // changes during the drag (only the preview does) — `targetIndex`
+          // below is always relative to THIS, not to whatever the live DOM
+          // looks like mid-gesture.
+          const startOrder = [...selectedIds];
+          const startIndex = startOrder.indexOf(id);
+          const rows = [...pickList.children];
+          // Centre-to-centre row spacing, including the list's flex `gap` —
+          // measured, not assumed, so a density/theme change can't desync it.
+          const slotHeight = rows.length > 1
+            ? Math.abs(rows[1].getBoundingClientRect().top - rows[0].getBoundingClientRect().top)
+            : row.getBoundingClientRect().height;
+          const startClientY = event.clientY;
+          let targetIndex = startIndex;
           row.dataset.dragging = "yes";
-          // Hit-testing under the pointer would otherwise keep resolving to
-          // the dragged row itself once it starts following the cursor.
-          row.style.pointerEvents = "none";
-          const move = (moveEvent) => {
-            if (!drag) return;
-            drag.deltaY = moveEvent.clientY - drag.startClientY;
-            const current = [...pickList.children].find((r) => r.dataset.id === drag.id);
-            if (current) {
-              current.style.transition = "none";
-              current.style.transform = `translateY(${drag.deltaY}px)`;
-            }
-            const overEl = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
-            const over = overEl instanceof Element ? overEl.closest(".reportit-pickrow") : null;
-            if (over && over.dataset.id && over.dataset.id !== drag.id) {
-              const from = selectedIds.indexOf(drag.id);
-              const to = selectedIds.indexOf(over.dataset.id);
-              if (from >= 0 && to >= 0 && from !== to) {
-                const [moved] = selectedIds.splice(from, 1);
-                selectedIds.splice(to, 0, moved);
-                // Re-render now, live, so the other rows visibly slide out of
-                // the way as the pointer passes over them, not just on drop.
-                renderPicks();
-              }
+
+          const apply = (clientY) => {
+            const deltaY = clientY - startClientY;
+            row.style.transition = "none";
+            row.style.transform = `translateY(${deltaY}px)`;
+            const slots = Math.round(deltaY / slotHeight);
+            targetIndex = Math.max(0, Math.min(startOrder.length - 1, startIndex + slots));
+            for (const other of rows) {
+              if (other === row) continue;
+              const otherIndex = startOrder.indexOf(other.dataset.id);
+              let shift = 0;
+              if (targetIndex > startIndex && otherIndex > startIndex && otherIndex <= targetIndex) shift = -1;
+              else if (targetIndex < startIndex && otherIndex < startIndex && otherIndex >= targetIndex) shift = 1;
+              other.style.transition = reduceMotion ? "none" : "transform 140ms cubic-bezier(.2, .8, .2, 1)";
+              other.style.transform = shift ? `translateY(${shift * slotHeight}px)` : "";
             }
           };
+          apply(startClientY);
+          const move = (moveEvent) => apply(moveEvent.clientY);
           const up = () => {
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
-            const finishedId = drag ? drag.id : null;
-            drag = null;
-            const finished = finishedId ? [...pickList.children].find((r) => r.dataset.id === finishedId) : null;
-            if (finished) {
-              delete finished.dataset.dragging;
-              finished.style.pointerEvents = "";
-              finished.style.transition = reduceMotion ? "none" : "transform 140ms cubic-bezier(.2, .8, .2, 1)";
-              finished.style.transform = "";
+            if (targetIndex !== startIndex) {
+              const [moved] = selectedIds.splice(startIndex, 1);
+              selectedIds.splice(targetIndex, 0, moved);
             }
+            // One clean rebuild commits the move, resets every inline
+            // transform/transition, and reattaches fresh listeners. Skips
+            // the FLIP playback: the shift preview above already left every
+            // row exactly where this puts it.
+            renderPicks({ animate: false });
             saveMemory();
           };
           window.addEventListener("pointermove", move);
@@ -880,13 +906,13 @@ function mountSurface(context, { container }) {
       updateGenerateEnabled();
       saveMemory();
 
-      // FLIP playback: every row except the one a drag is actively driving
-      // (that one is following the pointer via its own transform above)
-      // animates from where it used to be to where the rebuild just put it.
-      if (!reduceMotion) {
+      // FLIP playback for the paths that still do a plain rebuild (the
+      // Move up/down buttons, ticking/unticking a pool row, Remove): every
+      // row animates from where it used to be to where the rebuild put it.
+      if (oldRects && !reduceMotion) {
         for (const row of pickList.children) {
           const id = row.dataset.id;
-          if (!id || (drag && drag.id === id)) continue;
+          if (!id) continue;
           const oldRect = oldRects.get(id);
           if (!oldRect) continue;
           const newRect = row.getBoundingClientRect();
@@ -898,17 +924,6 @@ function mountSurface(context, { container }) {
             row.style.transition = "transform 180ms cubic-bezier(.2, .8, .2, 1)";
             row.style.transform = "";
           });
-        }
-      }
-      // A drag in progress survives the rebuild above as a fresh DOM node —
-      // reapply the dragging state and the pointer-driven transform to it.
-      if (drag) {
-        const row = [...pickList.children].find((r) => r.dataset.id === drag.id);
-        if (row) {
-          row.dataset.dragging = "yes";
-          row.style.pointerEvents = "none";
-          row.style.transition = "none";
-          row.style.transform = `translateY(${drag.deltaY}px)`;
         }
       }
     }
@@ -1132,7 +1147,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.6",
+    version: "0.1.7",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",
