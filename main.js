@@ -901,8 +901,8 @@ function mountSurface(context, { container }) {
     // not the app's — hide it and drive the visible text ourselves so it stays
     // in the app's chosen language regardless of Windows locale.
     const logoInput = el("input", { className: "reportit-logo-input-native", type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
-    const logoChoose = el("button", { type: "button", className: "reportit-bulk", textContent: "Choose file" });
-    const logoStatus = el("span", { className: "reportit-logo-status", textContent: "No file chosen" });
+    const logoChoose = el("button", { type: "button", className: "reportit-bulk", textContent: "Choose footer logo" });
+    const logoStatus = el("span", { className: "reportit-logo-status", textContent: "No logo chosen" });
     const logoPreview = el("img", { className: "reportit-logo-preview", alt: "", hidden: true });
     const logoClear = el("button", { type: "button", className: "reportit-bulk", textContent: "Remove logo", hidden: true });
     logoChoose.addEventListener("click", () => logoInput.click());
@@ -910,7 +910,7 @@ function mountSurface(context, { container }) {
       logoPreview.hidden = !footerLogoUri;
       if (footerLogoUri) logoPreview.src = footerLogoUri;
       logoClear.hidden = !footerLogoUri;
-      logoStatus.textContent = footerLogoUri ? "Logo selected" : "No file chosen";
+      logoStatus.textContent = footerLogoUri ? "Logo selected" : "No logo chosen";
     };
     logoInput.addEventListener("change", () => {
       const file = logoInput.files && logoInput.files[0];
@@ -1118,7 +1118,16 @@ function mountSurface(context, { container }) {
     ]);
     shell.append(previewWrap);
 
-    editBtn.addEventListener("click", () => { previewWrap.hidden = true; builder.hidden = false; });
+    const exitPreview = () => { previewWrap.hidden = true; builder.hidden = false; };
+    editBtn.addEventListener("click", exitPreview);
+    // Core's global Back button unwinds *section* history, which never
+    // changes while inside this view — without this guard, Back on the
+    // generated-report screen jumps straight past the builder to whatever
+    // was open before ReportIt. Only consume Back while the preview is
+    // actually showing; otherwise fall through to Core's own history.
+    window.dispatchEvent(new CustomEvent("notible:plugin-back-guard", {
+      detail: { handler: () => { if (previewWrap.hidden) return false; exitPreview(); return true; } },
+    }));
 
     printBtn.addEventListener("click", () => {
       if (!preview.firstChild || printHost) return;
@@ -1204,6 +1213,7 @@ function mountSurface(context, { container }) {
       disposed = true;
       window.removeEventListener("afterprint", onAfterPrint);
       restorePrint();
+      window.dispatchEvent(new CustomEvent("notible:plugin-back-guard", { detail: { handler: null } }));
       root.remove();
     },
   };
@@ -1359,7 +1369,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.8",
+    version: "0.1.9",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",
