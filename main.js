@@ -527,7 +527,12 @@ async function renderReport(model, dataUris, measurementHost) {
   newPage("contents");
   content.append(el("h2", { className: "rp-toc-title", textContent: "Contents" }));
   for (const [index, title] of model.toc.entries()) {
-    const row = el("p", { className: "rp-toc-entry" }, [
+    // An in-document link, not a URL — Chromium's print-to-PDF keeps a
+    // same-document `href="#id"` as a clickable internal link in the
+    // resulting PDF when the target element carries a matching `id`
+    // (set on each section's heading below), so this costs nothing extra
+    // at print time.
+    const row = el("a", { className: "rp-toc-entry", href: `#rp-section-${index}` }, [
       el("span", { className: "rp-toc-number", textContent: String(index + 1).padStart(2, "0") }),
       el("span", { textContent: title }),
     ]);
@@ -536,11 +541,11 @@ async function renderReport(model, dataUris, measurementHost) {
     if (pages.length > before) content.dataset.continued = "contents";
   }
 
-  for (const section of model.sections) {
+  for (const [index, section] of model.sections.entries()) {
     // Every case starts at the same safe top margin on a fresh sheet, including
     // the first one after a potentially multi-page table of contents.
     newPage("case");
-    const heading = el("header", { className: "rp-section-head" }, [
+    const heading = el("header", { className: "rp-section-head", id: `rp-section-${index}` }, [
       el("h2", { className: "rp-section-title", textContent: section.title }),
     ]);
     if (section.type) heading.append(el("p", { className: "rp-section-type", textContent: section.type }));
@@ -735,6 +740,9 @@ function mountSurface(context, { container }) {
   container.append(root);
 
   let disposed = false;
+  // Themed Select controls mounted via `context.ui.mountSelect` — each is its
+  // own Disposable, torn down alongside the rest of the surface.
+  const mountedControls = [];
   shell.append(el("p", { className: "rp-note", textContent: "Reading the workspace…" }));
 
   // reparent-print teardown state, set up once
@@ -819,7 +827,7 @@ function mountSurface(context, { container }) {
         footerNote: footerNoteInput.value,
         footerLogoUri,
         coverLogos: [...coverLogos],
-        footerAlign: footerAlign.value,
+        footerAlign: footerAlignValue,
         pageNumbers: pageNumbers.checked,
         types: [...filters.types],
         container: filters.container,
@@ -827,6 +835,7 @@ function mountSurface(context, { container }) {
         tag: filters.tag,
         selectedIds: [...selectedIds],
         propKeys: [...selectedPropKeys],
+        showType: showType.checked,
       };
     };
 
@@ -850,29 +859,38 @@ function mountSurface(context, { container }) {
       });
       typeChips.append(chip);
     }
-    const containerSel = el("select", { className: "reportit-select" });
-    containerSel.append(el("option", { value: "", textContent: "Any container" }));
-    for (const [pid, title] of [...parentTitles].sort((a, b) => a[1].localeCompare(b[1]))) {
-      containerSel.append(el("option", { value: pid, textContent: title }));
-    }
-    containerSel.value = filters.container;
-    filters.container = containerSel.value; // drop a remembered id that no longer resolves
-    containerSel.addEventListener("change", () => { filters.container = containerSel.value; renderPool(); });
+    // Container / tag filters use the host's themed Select (`context.ui.mountSelect`,
+    // API 1.11) rather than a native <select> — a native control looks like
+    // every other browser page, not like the app's own `nb-select` dropdowns
+    // (see the Footer alignment control below for the same reasoning).
+    const containerOptions = [
+      { value: "", label: "Any container" },
+      ...[...parentTitles].sort((a, b) => a[1].localeCompare(b[1])).map(([pid, title]) => ({ value: pid, label: title })),
+    ];
+    if (!containerOptions.some((o) => o.value === filters.container)) filters.container = ""; // drop a remembered id that no longer resolves
+    const containerMount = el("div", { className: "reportit-select-mount" });
+    mountedControls.push(context.ui.mountSelect(containerMount, {
+      value: filters.container,
+      options: containerOptions,
+      ariaLabel: "Container",
+      onChange: (value) => { filters.container = value; renderPool(); },
+    }));
     // Tag filter: union of every object's props.tags. Hidden entirely when the
     // workspace has no tags, so it does not add a dead control to the bar.
     const allTags = [...new Set(pool.flatMap((o) => o.tags))].sort((a, b) => a.localeCompare(b));
-    const tagSel = el("select", { className: "reportit-select" });
-    tagSel.append(el("option", { value: "", textContent: "Any tag" }));
-    for (const tag of allTags) tagSel.append(el("option", { value: tag, textContent: tag }));
-    tagSel.value = allTags.includes(filters.tag) ? filters.tag : "";
-    filters.tag = tagSel.value;
-    tagSel.hidden = allTags.length === 0;
-    tagSel.addEventListener("change", () => { filters.tag = tagSel.value; renderPool(); });
+    filters.tag = allTags.includes(filters.tag) ? filters.tag : "";
+    const tagMount = el("div", { className: "reportit-select-mount", hidden: allTags.length === 0 });
+    mountedControls.push(context.ui.mountSelect(tagMount, {
+      value: filters.tag,
+      options: [{ value: "", label: "Any tag" }, ...allTags.map((tag) => ({ value: tag, label: tag }))],
+      ariaLabel: "Tag",
+      onChange: (value) => { filters.tag = value; renderPool(); },
+    }));
     const searchInput = el("input", { className: "reportit-search", type: "search", placeholder: "Search titles…" });
     searchInput.value = filters.search;
     searchInput.addEventListener("input", () => { filters.search = searchInput.value.trim().toLowerCase(); renderPool(); });
     const typeDetails = el("details", { className: "reportit-type-filter" }, [el("summary", { textContent: "Types" }), typeChips]);
-    filterBar.append(searchInput, containerSel, tagSel, typeDetails);
+    filterBar.append(searchInput, containerMount, tagMount, typeDetails);
     const poolCount = el("span", { className: "reportit-count" });
     poolCol.append(
       el("h3", { className: "reportit-col-head reportit-pool-head" }, [textNode("Choose content"), poolCount]),
@@ -956,12 +974,14 @@ function mountSurface(context, { container }) {
     const footerNoteInput = el("input", { className: "reportit-title-input", type: "text", placeholder: "Footer note, e.g. Confidential", value: typeof mem.footerNote === "string" ? mem.footerNote : "" });
     footerNoteInput.addEventListener("input", saveMemory);
     footerNoteInput.maxLength = 240;
-    const footerAlign = el("select", { className: "reportit-select", ariaLabel: "Footer alignment" }, [
-      el("option", { value: "left", textContent: "Footer on the left" }),
-      el("option", { value: "right", textContent: "Footer on the right" }),
-    ]);
-    footerAlign.value = mem.footerAlign === "left" ? "left" : "right";
-    footerAlign.addEventListener("change", saveMemory);
+    let footerAlignValue = mem.footerAlign === "left" ? "left" : "right";
+    const footerAlignMount = el("div", { className: "reportit-select-mount" });
+    mountedControls.push(context.ui.mountSelect(footerAlignMount, {
+      value: footerAlignValue,
+      options: [{ value: "left", label: "Footer on the left" }, { value: "right", label: "Footer on the right" }],
+      ariaLabel: "Footer alignment",
+      onChange: (value) => { footerAlignValue = value; saveMemory(); },
+    }));
     const pageNumbers = el("input", { type: "checkbox", checked: mem.pageNumbers === true });
     pageNumbers.addEventListener("change", saveMemory);
     // Native file inputs render their button/status text in the OS UI language,
@@ -992,7 +1012,7 @@ function mountSurface(context, { container }) {
     });
     logoClear.addEventListener("click", () => { footerLogoUri = ""; saveMemory(); syncLogo(); });
     footerFields.append(footerNoteInput, el("div", { className: "reportit-logo-row" }, [logoInput, logoChoose, logoStatus, logoPreview, logoClear]),
-      el("div", { className: "reportit-logo-row" }, [footerAlign, el("label", { className: "reportit-option" }, [pageNumbers, textNode("Number pages (including cover)")]) ]));
+      el("div", { className: "reportit-logo-row" }, [footerAlignMount, el("label", { className: "reportit-option" }, [pageNumbers, textNode("Number pages (including cover)")]) ]));
     const coverFields = el("details", { className: "reportit-document-options" }, [el("summary", { textContent: "Cover logos (optional)" })]);
     for (const [index, label] of ["Company logo", "Client logo"].entries()) {
       const input = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
@@ -1021,19 +1041,36 @@ function mountSurface(context, { container }) {
     // A note missing a checked key just skips that line at render time, so
     // one picklist covers notes whose fields differ (see design discussion:
     // per-note picking was ruled out as a v2, not now).
+    // Properties to print under each section's title. Chips are scoped to
+    // the *currently selected* sections, not the whole workspace pool — a
+    // flat union across every type in the workspace (Task/Project/Note, each
+    // with its own schema) grows into a wall of unrelated fields (Budget,
+    // Milestone, Cycle, ...) the moment a report mixes types; showing only
+    // keys at least one selected note actually has keeps it to what's
+    // relevant for THIS report. A checked key stays checked even if it
+    // scrolls out of the visible set (e.g. every note carrying it gets
+    // removed) — it reappears, still checked, if a matching note comes back.
+    const showType = el("input", { type: "checkbox", checked: mem.showType !== false });
+    showType.addEventListener("change", saveMemory);
     const propertyChips = el("div", { className: "reportit-typechips" });
-    for (const { key, label } of propertyCatalog) {
-      const chip = el("button", { type: "button", className: "reportit-chip", textContent: label });
-      chip.dataset.on = selectedPropKeys.has(key) ? "yes" : "no";
-      chip.addEventListener("click", () => {
-        if (selectedPropKeys.has(key)) { selectedPropKeys.delete(key); chip.dataset.on = "no"; }
-        else { selectedPropKeys.add(key); chip.dataset.on = "yes"; }
-        saveMemory();
-      });
-      propertyChips.append(chip);
+    function renderPropertyChips() {
+      propertyChips.replaceChildren();
+      const visible = propertyCatalog.filter((p) => selectedIds.some((id) => propertyValuesById.get(id)?.[p.key] !== undefined));
+      for (const { key, label } of visible) {
+        const chip = el("button", { type: "button", className: "reportit-chip", textContent: label });
+        chip.dataset.on = selectedPropKeys.has(key) ? "yes" : "no";
+        chip.addEventListener("click", () => {
+          if (selectedPropKeys.has(key)) { selectedPropKeys.delete(key); chip.dataset.on = "no"; }
+          else { selectedPropKeys.add(key); chip.dataset.on = "yes"; }
+          saveMemory();
+        });
+        propertyChips.append(chip);
+      }
+      if (!visible.length) propertyChips.append(el("p", { className: "rp-note", textContent: "None of the selected sections have a custom property." }));
     }
     const propertiesDetails = el("details", { className: "reportit-type-filter", hidden: propertyCatalog.length === 0 }, [
       el("summary", { textContent: "Properties to include" }),
+      el("label", { className: "reportit-select-all" }, [showType, textNode("Show note type (Task, Project, …)")]),
       propertyChips,
     ]);
     const pickList = el("div", { className: "reportit-list reportit-picklist" });
@@ -1123,8 +1160,41 @@ function mountSurface(context, { container }) {
           let targetIndex = startIndex;
           row.dataset.dragging = "yes";
 
+          // Auto-scroll the list when the pointer nears its top/bottom edge —
+          // without this, dragging toward a row above/below the visible
+          // window just runs the dragged row into the container's
+          // `overflow-y: auto` clip and it disappears mid-drag, with no way
+          // to reach anything outside the current scroll position. Scrolling
+          // the container changes the dragged row's *unscrolled* screen
+          // position, so `scrollAdjust` folds that shift back into `apply`'s
+          // deltaY — otherwise the row would lag behind or jump once
+          // autoscroll starts moving content under it.
+          const EDGE_ZONE = 28;
+          const MAX_SCROLL_SPEED = 16;
+          let lastClientY = startClientY;
+          let scrollAdjust = 0;
+          let autoScrollFrame = null;
+          const autoScrollTick = () => {
+            const listRect = pickList.getBoundingClientRect();
+            let speed = 0;
+            if (lastClientY < listRect.top + EDGE_ZONE) {
+              speed = -MAX_SCROLL_SPEED * Math.min(1, (listRect.top + EDGE_ZONE - lastClientY) / EDGE_ZONE);
+            } else if (lastClientY > listRect.bottom - EDGE_ZONE) {
+              speed = MAX_SCROLL_SPEED * Math.min(1, (lastClientY - (listRect.bottom - EDGE_ZONE)) / EDGE_ZONE);
+            }
+            if (speed) {
+              const before = pickList.scrollTop;
+              pickList.scrollTop = Math.max(0, Math.min(pickList.scrollHeight - pickList.clientHeight, before + speed));
+              const applied = pickList.scrollTop - before;
+              if (applied) { scrollAdjust += applied; apply(lastClientY); }
+            }
+            autoScrollFrame = requestAnimationFrame(autoScrollTick);
+          };
+          autoScrollFrame = requestAnimationFrame(autoScrollTick);
+
           const apply = (clientY) => {
-            const deltaY = clientY - startClientY;
+            lastClientY = clientY;
+            const deltaY = clientY - startClientY + scrollAdjust;
             row.style.transition = "none";
             row.style.transform = `translateY(${deltaY}px)`;
             const slots = Math.round(deltaY / slotHeight);
@@ -1144,6 +1214,7 @@ function mountSurface(context, { container }) {
           const up = () => {
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
+            if (autoScrollFrame !== null) cancelAnimationFrame(autoScrollFrame);
             if (targetIndex !== startIndex) {
               const [moved] = selectedIds.splice(startIndex, 1);
               selectedIds.splice(targetIndex, 0, moved);
@@ -1170,6 +1241,7 @@ function mountSurface(context, { container }) {
       });
       if (!selectedIds.length) pickList.append(el("p", { className: "rp-note", textContent: "Choose objects on the left, or select all filtered results." }));
       pickCount.textContent = `${selectedIds.length} sections`;
+      renderPropertyChips();
       updateGenerateEnabled();
       saveMemory();
 
@@ -1244,7 +1316,7 @@ function mountSurface(context, { container }) {
         const properties = propertyCatalog
           .filter((p) => selectedPropKeys.has(p.key) && values[p.key] !== undefined)
           .map((p) => ({ label: p.label, value: String(values[p.key]) }));
-        return { title: o.title, type: typeLabel(o.type), blocks: normalizeHeadings(renderMarkdown(tiptapToMarkdown(o.content))), properties };
+        return { title: o.title, type: showType.checked ? typeLabel(o.type) : "", blocks: normalizeHeadings(renderMarkdown(tiptapToMarkdown(o.content))), properties };
       });
       const refs = [...new Set(sections.flatMap((s) => mediaRefsIn(s.blocks)))];
       const total = refs.length;
@@ -1265,7 +1337,7 @@ function mountSurface(context, { container }) {
         description: descInput.value,
         dateText: formatDate(new Date()),
         sections,
-        footer: { note: footerNoteInput.value, logoUri: footerLogoUri, align: footerAlign.value, pageNumbers: pageNumbers.checked },
+        footer: { note: footerNoteInput.value, logoUri: footerLogoUri, align: footerAlignValue, pageNumbers: pageNumbers.checked },
         coverLogos,
       });
       const documentPages = await renderReport(model, result.uris, root);
@@ -1306,6 +1378,7 @@ function mountSurface(context, { container }) {
       window.removeEventListener("afterprint", onAfterPrint);
       restorePrint();
       window.dispatchEvent(new CustomEvent("notible:plugin-back-guard", { detail: { handler: null } }));
+      for (const control of mountedControls) control.dispose();
       root.remove();
     },
   };
@@ -1359,10 +1432,14 @@ const styles = `
 .reportit-chip { border: 1px solid var(--notible-border); border-radius: 7px; background: transparent; color: var(--notible-muted); font: inherit; font-size: 12px; padding: 3px 9px; cursor: pointer; }
 .reportit-chip:hover { border-color: var(--notible-accent); color: var(--notible-text); }
 .reportit-chip[data-on="yes"] { border-color: var(--notible-accent); background: var(--notible-selected); color: var(--notible-accent); }
-.reportit-select, .reportit-search, .reportit-title-input, .reportit-desc-input { min-width: 0; border: 1px solid var(--notible-border); border-radius: 7px; background: var(--notible-surface); color: var(--notible-text); font: inherit; font-size: 12px; padding: 6px 9px; }
+.reportit-search, .reportit-title-input, .reportit-desc-input { min-width: 0; border: 1px solid var(--notible-border); border-radius: 7px; background: var(--notible-surface); color: var(--notible-text); font: inherit; font-size: 12px; padding: 6px 9px; }
 .reportit-desc-input { resize: vertical; }
 .reportit-search { flex: 1 0 100%; box-sizing: border-box; height: 36px; }
-.reportit-filters > .reportit-select { flex: 1; height: 34px; }
+/* Container / tag filters and the footer-alignment control are the host's
+   themed Select (context.ui.mountSelect), not a native select — this
+   wrapper just sizes the mount point, the control paints itself. */
+.reportit-select-mount { min-width: 140px; }
+.reportit-filters > .reportit-select-mount { flex: 1; }
 .reportit-title-input { min-height: 36px; box-sizing: border-box; }
 .reportit-list { display: flex; flex-direction: column; gap: 2px; max-height: 46vh; overflow-y: auto; border: 1px solid var(--notible-border-subtle, var(--notible-border)); border-radius: 8px; padding: 4px; }
 .reportit-poolrow { display: flex; align-items: center; gap: 8px; padding: 9px 6px; border-radius: 6px; cursor: pointer; }
@@ -1410,7 +1487,7 @@ const styles = `
 .rp-date { margin: 0 0 16px; color: #666; font-family: system-ui, sans-serif; font-size: 10pt; }
 .rp-desc { margin: 0; max-width: 60ch; color: #333; }
 .rp-doc .rp-toc-title { font-size: 22pt; margin: 0 0 10mm; }
-.rp-doc .rp-toc-entry { display: flex; align-items: baseline; gap: 4mm; font-size: 11pt; line-height: 1.65; margin: 0 0 4mm; }
+.rp-doc .rp-toc-entry { display: flex; align-items: baseline; gap: 4mm; font-size: 11pt; line-height: 1.65; margin: 0 0 4mm; color: inherit; text-decoration: none; }
 .rp-doc .rp-toc-number { min-width: 7mm; flex: none; color: #777; font: 9pt system-ui, sans-serif; font-variant-numeric: tabular-nums; }
 .rp-section { margin: 0; }
 .rp-doc .rp-section-title { font-size: 18pt; font-weight: 650; margin: 0 0 3mm; white-space: normal; overflow: visible; text-overflow: clip; height: auto; max-height: none; overflow-wrap: anywhere; }
@@ -1466,7 +1543,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.10",
+    version: "0.1.11",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",

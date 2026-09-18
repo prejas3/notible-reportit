@@ -246,4 +246,24 @@ assert.ok(source.includes("filters.tag") && source.includes('"Any tag"') && sour
 assert.ok(source.includes("const matchesFilters =") && source.includes("selectAll.indeterminate") && source.includes('textContent: "Clear selection"'), "tri-state selection of filtered objects, and clear");
 assert.ok(source.includes("readTags(o.props)"), "pool rows carry their tags, read from props");
 
+// --- themed dropdowns: container/tag/footer-alignment use the host Select,
+// not a native <select> (which looks like a bare browser control, not the
+// app's own nb-select dropdowns)
+assert.ok(!/el\("select"/.test(source), "no native <select> is built by hand anymore");
+assert.ok((source.match(/context\.ui\.mountSelect\(/g) || []).length === 3, "container, tag and footer-alignment each mount the themed Select");
+assert.ok(source.includes("for (const control of mountedControls) control.dispose()"), "mounted Select controls are disposed with the surface");
+
+// --- drag auto-scroll: dragging toward the pick list's edge scrolls it,
+// rather than letting the dragged row run into the overflow clip and vanish
+assert.ok(source.includes("autoScrollTick") && source.includes("cancelAnimationFrame(autoScrollFrame)"), "drag has an edge-triggered auto-scroll loop, cancelled on drop");
+assert.ok(source.includes("scrollAdjust"), "the dragged row's position compensates for auto-scroll, not just the raw pointer delta");
+
+// --- table of contents links to its section
+assert.ok(source.includes('el("a", { className: "rp-toc-entry", href: `#rp-section-${index}` }') , "each contents row is an in-document link to its section");
+assert.ok(source.includes('id: `rp-section-${index}`'), "each section heading carries the matching anchor id");
+
+// --- properties picker is scoped to the current selection, and note type is optional
+assert.ok(source.includes("propertyCatalog.filter((p) => selectedIds.some((id) => propertyValuesById.get(id)?.[p.key] !== undefined))"), "the properties picker only offers keys present on a currently selected note");
+assert.ok(source.includes("showType.checked ? typeLabel(o.type) : \"\""), "the note-type line is optional, off hides it entirely rather than printing a blank");
+
 console.log("Notible ReportIt self-check passed.");
