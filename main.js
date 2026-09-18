@@ -312,6 +312,9 @@ export function reportModel({ title, description, dateText, sections, footer, co
     title: String(s.title ?? "").trim() || "Untitled",
     type: String(s.type ?? ""),
     blocks: Array.isArray(s.blocks) ? s.blocks : [],
+    properties: (Array.isArray(s.properties) ? s.properties : [])
+      .map((p) => ({ label: String(p?.label ?? "").trim(), value: String(p?.value ?? "").trim() }))
+      .filter((p) => p.label && p.value),
   }));
   const f = footer && typeof footer === "object" ? footer : {};
   return {
@@ -541,6 +544,13 @@ async function renderReport(model, dataUris, measurementHost) {
       el("h2", { className: "rp-section-title", textContent: section.title }),
     ]);
     if (section.type) heading.append(el("p", { className: "rp-section-type", textContent: section.type }));
+    if (section.properties.length) {
+      const propsList = el("dl", { className: "rp-section-props" });
+      for (const p of section.properties) {
+        propsList.append(el("dt", { textContent: p.label }), el("dd", { textContent: p.value }));
+      }
+      heading.append(propsList);
+    }
     flow(heading);
     const blocks = [...renderBlocks(section.blocks, dataUris).childNodes];
     const flowBlock = (block) => {
@@ -657,6 +667,56 @@ function typeLabel(type) {
   return bare.charAt(0).toUpperCase() + bare.slice(1);
 }
 
+/** camelCase/kebab-case schema field name → a readable label, e.g. "dueDate"
+ *  → "Due date". Mirrors `labelOf` in `PropertiesEditor.tsx` — schema fields
+ *  carry no label of their own, so both places derive the same one. */
+function propLabelOf(name) {
+  const withoutTrailingId = String(name ?? "").replace(/Id$/, "");
+  const spaced = withoutTrailingId.replaceAll("-", " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/** Every note's custom properties, two flavours (see `properties-ui.tsx` /
+ *  `PropertiesEditor.tsx`): per-type schema fields (`types.schema.fields`,
+ *  no built-in label) and per-note ad-hoc `_customFields` (their own
+ *  label). Returns `{ catalog, valuesById }`: `catalog` is the deduplicated
+ *  `{key,label}` list across every note in the pool, for the picker;
+ *  `valuesById` maps note id → `{key: value}` for every key it actually has
+ *  set (empty/undefined values are dropped, so "does this note have it" is
+ *  just a `has()` away). */
+export function collectProperties(pool, typesByName) {
+  const catalog = new Map(); // key -> label
+  const valuesById = new Map();
+  for (const o of pool) {
+    let raw;
+    try { raw = JSON.parse(o.props || "{}"); } catch { raw = {}; }
+    const values = {};
+    const schemaFields = parseTypeSchemaFields(typesByName.get(o.type));
+    for (const key of Object.keys(schemaFields)) {
+      if (!catalog.has(key)) catalog.set(key, propLabelOf(key));
+      const v = raw[key];
+      if (v !== undefined && v !== null && String(v).trim() !== "") values[key] = v;
+    }
+    const customFields = Array.isArray(raw._customFields) ? raw._customFields : [];
+    for (const field of customFields) {
+      if (!field || typeof field.key !== "string" || typeof field.label !== "string") continue;
+      if (!catalog.has(field.key)) catalog.set(field.key, field.label);
+      const v = raw[field.key];
+      if (v !== undefined && v !== null && String(v).trim() !== "") values[field.key] = v;
+    }
+    if (Object.keys(values).length) valuesById.set(o.id, values);
+  }
+  return { catalog: [...catalog].map(([key, label]) => ({ key, label })), valuesById };
+}
+
+function parseTypeSchemaFields(type) {
+  if (!type) return {};
+  try {
+    const schema = JSON.parse(type.schema);
+    return schema && typeof schema.fields === "object" && schema.fields ? schema.fields : {};
+  } catch { return {}; }
+}
+
 function formatDate(date) {
   // Always English — the document is for a client or a manager, and the rest
   // of the report chrome (headings, "Contents") is English too.
@@ -695,13 +755,16 @@ function mountSurface(context, { container }) {
 
   void (async () => {
     let objects;
+    let types;
     try {
       objects = await context.data.objects.query({ limit: 5000 });
+      types = await context.data.types.list();
     } catch (cause) {
       if (!disposed) shell.replaceChildren(el("p", { className: "rp-note", textContent: String(cause?.message ?? cause) }));
       return;
     }
     if (disposed) return;
+    const typesByName = new Map((types ?? []).map((t) => [t.name, t]));
 
     const readTags = (raw) => {
       try {
@@ -716,8 +779,10 @@ function mountSurface(context, { container }) {
       content: String(o.content ?? ""),
       parentId: o.parent_id ?? null,
       tags: readTags(o.props),
+      props: o.props,
     }));
     const byId = new Map(pool.map((o) => [o.id, o]));
+    const { catalog: propertyCatalog, valuesById: propertyValuesById } = collectProperties(pool, typesByName);
     const parentTitles = new Map();
     for (const o of pool) {
       if (o.parentId && byId.has(o.parentId) && !parentTitles.has(o.parentId)) {
@@ -740,6 +805,7 @@ function mountSurface(context, { container }) {
     let footerLogoUri = typeof mem.footerLogoUri === "string" && mem.footerLogoUri.startsWith("data:image/") ? mem.footerLogoUri : "";
     const coverLogos = [0, 1].map((i) => typeof mem.coverLogos?.[i] === "string" ? mem.coverLogos[i] : "");
     const selectedIds = Array.isArray(mem.selectedIds) ? mem.selectedIds.filter((id) => pool.some((o) => o.id === id)) : []; // ordered
+    const selectedPropKeys = new Set(Array.isArray(mem.propKeys) ? mem.propKeys.filter((key) => propertyCatalog.some((p) => p.key === key)) : []);
     const filters = {
       types: new Set(Array.isArray(mem.types) ? mem.types : []),
       container: typeof mem.container === "string" ? mem.container : "",
@@ -760,6 +826,7 @@ function mountSurface(context, { container }) {
         search: filters.search,
         tag: filters.tag,
         selectedIds: [...selectedIds],
+        propKeys: [...selectedPropKeys],
       };
     };
 
@@ -948,8 +1015,29 @@ function mountSurface(context, { container }) {
       sync();
     }
     syncLogo();
+    // Properties to print under each section's title — a workspace-wide
+    // picklist of the custom property keys found on any note in the pool
+    // (schema fields + per-note `_customFields`, see `collectProperties`).
+    // A note missing a checked key just skips that line at render time, so
+    // one picklist covers notes whose fields differ (see design discussion:
+    // per-note picking was ruled out as a v2, not now).
+    const propertyChips = el("div", { className: "reportit-typechips" });
+    for (const { key, label } of propertyCatalog) {
+      const chip = el("button", { type: "button", className: "reportit-chip", textContent: label });
+      chip.dataset.on = selectedPropKeys.has(key) ? "yes" : "no";
+      chip.addEventListener("click", () => {
+        if (selectedPropKeys.has(key)) { selectedPropKeys.delete(key); chip.dataset.on = "no"; }
+        else { selectedPropKeys.add(key); chip.dataset.on = "yes"; }
+        saveMemory();
+      });
+      propertyChips.append(chip);
+    }
+    const propertiesDetails = el("details", { className: "reportit-type-filter", hidden: propertyCatalog.length === 0 }, [
+      el("summary", { textContent: "Properties to include" }),
+      propertyChips,
+    ]);
     const pickList = el("div", { className: "reportit-list reportit-picklist" });
-    pickCol.append(el("h3", { className: "reportit-col-head reportit-selection-head", textContent: "Sections · drag to reorder" }), pickList, coverFields, footerFields);
+    pickCol.append(el("h3", { className: "reportit-col-head reportit-selection-head", textContent: "Sections · drag to reorder" }), pickList, propertiesDetails, coverFields, footerFields);
     const generateBtn = el("button", { type: "button", className: "reportit-generate", textContent: "Generate report" });
     pickCol.append(generateBtn);
     const genNote = el("p", { className: "rp-note" });
@@ -1152,7 +1240,11 @@ function mountSurface(context, { container }) {
       try {
       const sections = selectedIds.map((id) => {
         const o = byId.get(id);
-        return { title: o.title, type: typeLabel(o.type), blocks: normalizeHeadings(renderMarkdown(tiptapToMarkdown(o.content))) };
+        const values = propertyValuesById.get(id) ?? {};
+        const properties = propertyCatalog
+          .filter((p) => selectedPropKeys.has(p.key) && values[p.key] !== undefined)
+          .map((p) => ({ label: p.label, value: String(values[p.key]) }));
+        return { title: o.title, type: typeLabel(o.type), blocks: normalizeHeadings(renderMarkdown(tiptapToMarkdown(o.content))), properties };
       });
       const refs = [...new Set(sections.flatMap((s) => mediaRefsIn(s.blocks)))];
       const total = refs.length;
@@ -1324,6 +1416,11 @@ const styles = `
 .rp-doc .rp-section-title { font-size: 18pt; font-weight: 650; margin: 0 0 3mm; white-space: normal; overflow: visible; text-overflow: clip; height: auto; max-height: none; overflow-wrap: anywhere; }
 .rp-doc .rp-section-head { margin-bottom: 8mm; }
 .rp-section-type { margin: 2px 0 10px; font-family: system-ui, sans-serif; font-size: 8pt; color: #888; text-transform: lowercase; }
+.rp-section-props { display: flex; flex-wrap: wrap; gap: 3mm 8mm; margin: 0 0 6mm; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 9pt; }
+.rp-section-props dt { margin: 0; color: #888; }
+.rp-section-props dt::after { content: ":"; }
+.rp-section-props dd { margin: 0 0 0 4px; display: inline; color: #333; font-weight: 600; }
+.rp-section-props dt, .rp-section-props dd { display: inline-block; }
 .rp-body h3 { font-size: 13pt; margin: 16px 0 4px; }
 .rp-body h4 { font-size: 11.5pt; margin: 14px 0 4px; }
 .rp-body h5, .rp-body h6 { font-size: 11pt; margin: 12px 0 4px; }
@@ -1369,7 +1466,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.9",
+    version: "0.1.10",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",

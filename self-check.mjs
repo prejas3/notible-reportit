@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import plugin, {
   buildTocModel,
+  collectProperties,
   mediaRefsIn,
   mimeForExt,
   normalizeHeadings,
@@ -210,6 +211,35 @@ assert.ok(source.includes('addEventListener("pointerdown"') && source.includes('
 assert.ok(source.includes("reportit-move") && source.includes("movePick("), "the pick list also has explicit up/down buttons, not drag only");
 assert.ok(!source.includes("context.storage") && !source.includes("data.write"), "no cross-session persistence, no writes: builder state is a module-scoped var only");
 assert.ok(/let builderMemory = null;/.test(source) && source.includes("saveMemory()"), "the builder restores this session's last title/filters/selection from an in-memory var");
+
+// --- collectProperties: schema fields + per-note ad-hoc _customFields
+const typesByName = new Map([
+  ["issue", { name: "issue", schema: JSON.stringify({ fields: { severity: { type: "select", options: ["low", "high"] } } }) }],
+]);
+const propPool = [
+  { id: "1", type: "issue", props: JSON.stringify({ severity: "high", _customFields: [{ key: "custom_sf", label: "SF case number", type: "text" }], custom_sf: "SF-100" }) },
+  { id: "2", type: "issue", props: JSON.stringify({ _customFields: [{ key: "custom_jira", label: "JIRA case number", type: "text" }], custom_jira: "JIRA-9" }) }, // no severity set
+  { id: "3", type: "note", props: "{}" }, // nothing at all
+];
+const { catalog, valuesById } = collectProperties(propPool, typesByName);
+assert.deepEqual(catalog.sort((a, b) => a.key.localeCompare(b.key)), [
+  { key: "custom_jira", label: "JIRA case number" },
+  { key: "custom_sf", label: "SF case number" },
+  { key: "severity", label: "Severity" },
+], "the catalog is the union of schema fields and ad-hoc custom fields across the pool, deduplicated by key");
+assert.deepEqual(valuesById.get("1"), { severity: "high", custom_sf: "SF-100" }, "a note's own values only, empty/unset keys absent");
+assert.deepEqual(valuesById.get("2"), { custom_jira: "JIRA-9" }, "severity is unset on this note and is not reported as a value");
+assert.ok(!valuesById.has("3"), "a note with no property values at all is absent, not an empty object");
+
+// --- reportModel: section properties render only what's present, blank ones dropped
+const withProps = reportModel({
+  sections: [
+    { title: "Case A", properties: [{ label: "SF case number", value: "SF-100" }, { label: "JIRA case number", value: "  " }] },
+    { title: "Case B" }, // no properties key at all
+  ],
+});
+assert.deepEqual(withProps.sections[0].properties, [{ label: "SF case number", value: "SF-100" }], "a blank value is dropped, not printed as an empty line");
+assert.deepEqual(withProps.sections[1].properties, [], "a section with no properties input normalises to an empty list");
 
 // --- builder filters
 assert.ok(source.includes("filters.tag") && source.includes('"Any tag"') && source.includes("o.tags.includes(filters.tag)"), "the pool can be filtered by a props tag");
