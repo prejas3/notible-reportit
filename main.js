@@ -306,7 +306,7 @@ export function buildTocModel(sectionTitles) {
 
 /** The whole report as a plain object the DOM layer renders. Not a string,
  *  not DOM — serialisable, so the node test can assert on it. */
-export function reportModel({ title, description, dateText, sections, footer }) {
+export function reportModel({ title, description, dateText, sections, footer, coverLogos }) {
   const list = Array.isArray(sections) ? sections : [];
   const normalized = list.map((s) => ({
     title: String(s.title ?? "").trim() || "Untitled",
@@ -319,6 +319,7 @@ export function reportModel({ title, description, dateText, sections, footer }) 
       title: String(title ?? "").trim() || "Report",
       dateText: String(dateText ?? ""),
       description: String(description ?? "").trim(),
+      logos: (Array.isArray(coverLogos) ? coverLogos : []).slice(0, 2).filter((uri) => /^data:image\/(png|jpeg|webp|gif);base64,/i.test(uri)),
     },
     toc: buildTocModel(normalized.map((s) => s.title)),
     sections: normalized,
@@ -328,6 +329,8 @@ export function reportModel({ title, description, dateText, sections, footer }) 
     footer: {
       note: String(f.note ?? "").trim(),
       logoUri: typeof f.logoUri === "string" && f.logoUri.startsWith("data:image/") ? f.logoUri : "",
+      align: f.align === "left" ? "left" : "right",
+      pageNumbers: f.pageNumbers === true,
     },
   };
 }
@@ -422,51 +425,180 @@ function renderBlocks(blocks, dataUris) {
 }
 
 /** The model + resolved image data URIs → the `<article class="rp-doc">`. */
-function renderReport(model, dataUris) {
+async function renderReport(model, dataUris, measurementHost) {
   const doc = el("article", { className: "rp-doc" });
-
-  const cover = el("header", { className: "rp-cover" }, [
+  // Measure the very same fixed-size sheets that will be printed. Never put
+  // overflow:hidden on a sheet: an impossible layout must fail, not lose text.
+  const measure = el("div", { className: "reportit-measure", ariaHidden: "true" }, [doc]);
+  measurementHost.append(measure);
+  const pages = [];
+  let content;
+  const newPage = (kind) => {
+    const continuedContents = kind === "contents" && pages.some((page) => page.dataset.kind === "contents");
+    const page = el("section", { className: "rp-page" });
+    page.dataset.kind = kind;
+    content = el("div", { className: "rp-page-content rp-body" });
+    page.append(content);
+    doc.append(page);
+    pages.push(page);
+    if (continuedContents) content.append(el("h2", { className: "rp-toc-title", textContent: "Contents · continued" }));
+    return content;
+  };
+  const fits = () => content.scrollHeight <= content.clientHeight + 1;
+  const place = (node) => { content.append(node); const ok = fits(); if (!ok) node.remove(); return ok; };
+  const textPoint = (node, offset) => {
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    let text;
+    while ((text = walker.nextNode())) {
+      if (offset <= text.length) return [text, offset];
+      offset -= text.length;
+    }
+    return [node, node.childNodes.length];
+  };
+  const piece = (node, start, end) => {
+    const range = document.createRange();
+    range.setStart(...textPoint(node, start));
+    range.setEnd(...textPoint(node, end));
+    const clone = node.cloneNode(false);
+    clone.append(range.cloneContents());
+    return clone;
+  };
+  // Split only oversized text blocks, preserving inline marks with DOM ranges.
+  // Whole ordinary paragraphs move to the next sheet; long paragraphs/code can
+  // continue across sheets without a clipping boundary or a fixed footer overlap.
+  const flow = (node, kind = "case") => {
+    if (place(node)) return;
+    if (content.childNodes.length) {
+      const previous = content;
+      newPage(kind);
+      if (place(node)) return;
+      // An oversized block must use the remaining space after its heading,
+      // not strand that heading on an otherwise empty sheet.
+      pages.pop().remove();
+      content = previous;
+    }
+    const full = node.textContent || "";
+    if (!full.length) throw new Error("An image or block cannot fit on an A4 page.");
+    let start = 0;
+    while (start < full.length) {
+      let low = start + 1, high = full.length, best = start;
+      while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        const test = piece(node, start, middle);
+        if (place(test)) { test.remove(); best = middle; low = middle + 1; }
+        else high = middle - 1;
+      }
+      if (best === start && content.childNodes.length) { newPage(kind); continue; }
+      if (best === start) throw new Error("This block cannot fit safely on an A4 page.");
+      if (best < full.length) {
+        // Leave a little room for a clean continuation instead of splitting a word.
+        const prefix = full.slice(start, best);
+        const boundary = Math.max(prefix.lastIndexOf(" "), prefix.lastIndexOf("\n"));
+        if (boundary > prefix.length * .65) best = start + boundary + 1;
+        if (best > start && /[\uD800-\uDBFF]/.test(full[best - 1])) best -= 1;
+      }
+      content.append(piece(node, start, best));
+      start = best;
+      if (start < full.length) newPage(kind);
+    }
+  };
+  try {
+  await document.fonts.ready;
+  newPage("cover");
+  const cover = el("header", { className: "rp-cover" });
+  if (model.cover.logos.length) {
+    const logos = el("div", { className: "rp-cover-logos" });
+    for (const [index, uri] of model.cover.logos.entries()) logos.append(el("img", { src: uri, alt: index ? "Client logo" : "Company logo" }));
+    cover.append(logos);
+  }
+  cover.append(el("p", { className: "rp-cover-eyebrow", textContent: "REPORT" }),
     el("h1", { className: "rp-title", textContent: model.cover.title }),
-    el("p", { className: "rp-date", textContent: model.cover.dateText }),
-  ]);
+    el("p", { className: "rp-date", textContent: model.cover.dateText }));
   if (model.cover.description) {
     cover.append(el("p", { className: "rp-desc", textContent: model.cover.description }));
   }
-  doc.append(cover);
+  content.append(cover);
+  await Promise.all([...cover.querySelectorAll("img")].map((img) => img.decode().catch(() => {})));
+  if (!fits()) throw new Error("The cover is too long. Shorten the report title or description.");
 
-  const toc = el("nav", { className: "rp-toc" }, [el("h2", { textContent: "Contents" })]);
-  const ol = document.createElement("ol");
-  for (const title of model.toc) ol.append(el("li", { textContent: title }));
-  toc.append(ol);
-  doc.append(toc);
+  newPage("contents");
+  content.append(el("h2", { className: "rp-toc-title", textContent: "Contents" }));
+  for (const [index, title] of model.toc.entries()) {
+    const row = el("p", { className: "rp-toc-entry" }, [
+      el("span", { className: "rp-toc-number", textContent: String(index + 1).padStart(2, "0") }),
+      el("span", { textContent: title }),
+    ]);
+    const before = pages.length;
+    flow(row, "contents");
+    if (pages.length > before) content.dataset.continued = "contents";
+  }
 
-  model.sections.forEach((section, index) => {
-    const sec = el("section", { className: "rp-section" }, [
+  for (const section of model.sections) {
+    // Every case starts at the same safe top margin on a fresh sheet, including
+    // the first one after a potentially multi-page table of contents.
+    newPage("case");
+    const heading = el("header", { className: "rp-section-head" }, [
       el("h2", { className: "rp-section-title", textContent: section.title }),
     ]);
-    if (section.type) sec.append(el("p", { className: "rp-section-type", textContent: section.type }));
-    if (section.blocks.length) {
-      const body = el("div", { className: "rp-body" });
-      body.append(renderBlocks(section.blocks, dataUris));
-      sec.append(body);
+    if (section.type) heading.append(el("p", { className: "rp-section-type", textContent: section.type }));
+    flow(heading);
+    const blocks = [...renderBlocks(section.blocks, dataUris).childNodes];
+    const flowBlock = (block) => {
+      if (block.tagName === "BLOCKQUOTE") {
+        for (const child of [...block.children]) {
+          const quote = block.cloneNode(false); quote.append(child); flow(quote);
+        }
+      } else if (block.tagName === "OL" || block.tagName === "UL") {
+        for (const [itemIndex, item] of [...block.children].entries()) {
+          const list = block.cloneNode(false);
+          if (block.tagName === "OL") list.start = (block.start || 1) + itemIndex;
+          list.append(item); flow(list);
+        }
+      } else flow(block);
+    };
+    for (const [index, block] of blocks.entries()) {
+      if (block.tagName === "IMG") await block.decode().catch(() => {});
+      // Keep subsection headings with a useful first line of the following block.
+      if (/^H[1-6]$/.test(block.tagName) && blocks[index + 1]) {
+        const probe = blocks[index + 1].cloneNode(true);
+        probe.style.maxHeight = "18mm";
+        probe.style.overflow = "hidden";
+        content.append(block, probe);
+        const together = fits();
+        block.remove(); probe.remove();
+        if (!together && content.childNodes.length) newPage("case");
+      }
+      flowBlock(block);
     }
-    doc.append(sec);
-    if (index < model.sections.length - 1) doc.append(el("hr", { className: "rp-rule" }));
-  });
+  }
 
   const footer = model.footer ?? { note: "", logoUri: "" };
-  if (footer.note || footer.logoUri) {
+  for (const [index, page] of pages.entries()) {
+    if (!footer.note && !footer.logoUri && !footer.pageNumbers) continue;
     const foot = el("footer", { className: "rp-footer" });
+    foot.dataset.align = footer.align;
+    const branding = el("div", { className: "rp-footer-branding" });
     if (footer.logoUri) {
       const logo = el("img", { className: "rp-footer-logo", alt: "" });
       logo.src = footer.logoUri;
-      foot.append(logo);
+      branding.append(logo);
     }
-    if (footer.note) foot.append(el("span", { className: "rp-footer-note", textContent: footer.note }));
-    doc.append(foot);
+    if (footer.note) branding.append(el("span", { className: "rp-footer-note", textContent: footer.note }));
+    foot.append(branding);
+    if (footer.pageNumbers) foot.append(el("span", { className: "rp-page-number", textContent: `${index + 1} / ${pages.length}` }));
+    page.append(foot);
   }
-
+  await Promise.all([...doc.querySelectorAll("img")].map((img) => img.decode().catch(() => {})));
+  for (const page of pages) {
+    const body = page.querySelector(".rp-page-content");
+    const foot = page.querySelector(".rp-footer");
+    if (body.scrollHeight > body.clientHeight + 1 || (foot && foot.getBoundingClientRect().top < body.getBoundingClientRect().bottom + 8)) {
+      throw new Error("The footer is too tall. Use a shorter footer note or a smaller logo.");
+    }
+  }
+  doc.remove();
   return doc;
+  } finally { measure.remove(); }
 }
 
 // ------------------------------------------------------------- image loading
@@ -550,7 +682,7 @@ function mountSurface(context, { container }) {
   let savedDocTitle = null;
   const restorePrint = () => {
     if (printHost) {
-      preview.append(printHost.firstChild);
+      if (printHost.firstChild && preview) preview.append(printHost.firstChild);
       printHost.remove();
       printHost = null;
     }
@@ -606,6 +738,7 @@ function mountSurface(context, { container }) {
     //     no longer exist in the workspace are dropped)
     const mem = builderMemory ?? {};
     let footerLogoUri = typeof mem.footerLogoUri === "string" && mem.footerLogoUri.startsWith("data:image/") ? mem.footerLogoUri : "";
+    const coverLogos = [0, 1].map((i) => typeof mem.coverLogos?.[i] === "string" ? mem.coverLogos[i] : "");
     const selectedIds = Array.isArray(mem.selectedIds) ? mem.selectedIds.filter((id) => pool.some((o) => o.id === id)) : []; // ordered
     const filters = {
       types: new Set(Array.isArray(mem.types) ? mem.types : []),
@@ -619,6 +752,9 @@ function mountSurface(context, { container }) {
         description: descInput.value,
         footerNote: footerNoteInput.value,
         footerLogoUri,
+        coverLogos: [...coverLogos],
+        footerAlign: footerAlign.value,
+        pageNumbers: pageNumbers.checked,
         types: [...filters.types],
         container: filters.container,
         search: filters.search,
@@ -668,18 +804,20 @@ function mountSurface(context, { container }) {
     const searchInput = el("input", { className: "reportit-search", type: "search", placeholder: "Search titles…" });
     searchInput.value = filters.search;
     searchInput.addEventListener("input", () => { filters.search = searchInput.value.trim().toLowerCase(); renderPool(); });
-    filterBar.append(typeChips, containerSel, tagSel, searchInput);
+    const typeDetails = el("details", { className: "reportit-type-filter" }, [el("summary", { textContent: "Types" }), typeChips]);
+    filterBar.append(searchInput, containerSel, tagSel, typeDetails);
     const poolCount = el("span", { className: "reportit-count" });
     poolCol.append(
-      el("h3", { className: "reportit-col-head reportit-pool-head" }, [textNode("Workspace"), poolCount]),
+      el("h3", { className: "reportit-col-head reportit-pool-head" }, [textNode("Choose content"), poolCount]),
       filterBar,
     );
 
     const poolList = el("div", { className: "reportit-list" });
-    poolCol.append(poolList);
-    const addAllBtn = el("button", { type: "button", className: "reportit-bulk", textContent: "Add all matching" });
+    const selectAll = el("input", { type: "checkbox" });
+    const selectAllText = el("span", { textContent: "Select all results" });
+    poolCol.append(el("label", { className: "reportit-select-all" }, [selectAll, selectAllText]), poolList);
     const clearBtn = el("button", { type: "button", className: "reportit-bulk", textContent: "Clear selection" });
-    poolCol.append(el("div", { className: "reportit-bulkrow" }, [addAllBtn, clearBtn]));
+    poolCol.append(el("div", { className: "reportit-bulkrow" }, [clearBtn]));
 
     const matchesFilters = (o) => {
       if (filters.types.size && !filters.types.has(o.type)) return false;
@@ -689,8 +827,14 @@ function mountSurface(context, { container }) {
       return true;
     };
 
-    addAllBtn.addEventListener("click", () => {
-      for (const o of pool.filter(matchesFilters)) if (!selectedIds.includes(o.id)) selectedIds.push(o.id);
+    selectAll.addEventListener("change", () => {
+      const matching = new Set(pool.filter(matchesFilters).map((o) => o.id));
+      if (selectAll.checked) {
+        for (const id of matching) if (!selectedIds.includes(id)) selectedIds.push(id);
+      } else {
+        // Deselect only this filtered list; selections outside it stay intact.
+        for (let i = selectedIds.length - 1; i >= 0; i -= 1) if (matching.has(selectedIds[i])) selectedIds.splice(i, 1);
+      }
       renderPicks();
       renderPool();
     });
@@ -705,7 +849,11 @@ function mountSurface(context, { container }) {
       const rows = pool.filter(matchesFilters);
       poolCount.textContent = rows.length === pool.length ? `${pool.length}` : `${rows.length} / ${pool.length}`;
       const unpicked = rows.filter((o) => !selectedIds.includes(o.id)).length;
-      addAllBtn.disabled = unpicked === 0;
+      selectAll.disabled = rows.length === 0;
+      selectAll.checked = rows.length > 0 && unpicked === 0;
+      selectAll.indeterminate = unpicked > 0 && unpicked < rows.length;
+      selectAllText.textContent = `Select all results (${rows.length})`;
+      typeDetails.querySelector("summary").textContent = filters.types.size ? `Types (${filters.types.size})` : "Types · All";
       clearBtn.disabled = selectedIds.length === 0;
       for (const o of rows) {
         const row = el("label", { className: "reportit-poolrow" });
@@ -726,7 +874,7 @@ function mountSurface(context, { container }) {
 
     // --- pick column
     const pickCount = el("span", { className: "reportit-count" });
-    pickCol.append(el("h3", { className: "reportit-col-head" }, [textNode("Report"), pickCount]));
+    pickCol.append(el("h3", { className: "reportit-col-head" }, [textNode("Report details"), pickCount]));
     const titleInput = el("input", { className: "reportit-title-input", type: "text", placeholder: "Report title (required)", value: typeof mem.title === "string" ? mem.title : "" });
     const descInput = el("textarea", { className: "reportit-desc-input", placeholder: "Short description (optional)", rows: 2 });
     descInput.value = typeof mem.description === "string" ? mem.description : "";
@@ -740,6 +888,15 @@ function mountSurface(context, { container }) {
     footerFields.append(el("h3", { className: "reportit-col-head", textContent: "Page footer (optional)" }));
     const footerNoteInput = el("input", { className: "reportit-title-input", type: "text", placeholder: "Footer note, e.g. Confidential", value: typeof mem.footerNote === "string" ? mem.footerNote : "" });
     footerNoteInput.addEventListener("input", saveMemory);
+    footerNoteInput.maxLength = 240;
+    const footerAlign = el("select", { className: "reportit-select", ariaLabel: "Footer alignment" }, [
+      el("option", { value: "left", textContent: "Footer on the left" }),
+      el("option", { value: "right", textContent: "Footer on the right" }),
+    ]);
+    footerAlign.value = mem.footerAlign === "left" ? "left" : "right";
+    footerAlign.addEventListener("change", saveMemory);
+    const pageNumbers = el("input", { type: "checkbox", checked: mem.pageNumbers === true });
+    pageNumbers.addEventListener("change", saveMemory);
     // Native file inputs render their button/status text in the OS UI language,
     // not the app's — hide it and drive the visible text ourselves so it stays
     // in the app's chosen language regardless of Windows locale.
@@ -759,18 +916,40 @@ function mountSurface(context, { container }) {
       const file = logoInput.files && logoInput.files[0];
       logoInput.value = "";
       if (!file) return;
+      if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) { context.ui.notice("Choose a PNG, JPEG, WebP or GIF image."); return; }
       if (file.size > 512 * 1024) { context.ui.notice("Footer logo must be under 512 KB."); return; }
       const reader = new FileReader();
-      reader.onload = () => { footerLogoUri = String(reader.result || ""); saveMemory(); syncLogo(); };
+      reader.onload = () => { if (disposed) return; footerLogoUri = String(reader.result || ""); saveMemory(); syncLogo(); };
       reader.onerror = () => context.ui.notice("Could not read that image.");
       reader.readAsDataURL(file);
     });
     logoClear.addEventListener("click", () => { footerLogoUri = ""; saveMemory(); syncLogo(); });
-    footerFields.append(footerNoteInput, el("div", { className: "reportit-logo-row" }, [logoInput, logoChoose, logoStatus, logoPreview, logoClear]));
-    pickCol.append(footerFields);
+    footerFields.append(footerNoteInput, el("div", { className: "reportit-logo-row" }, [logoInput, logoChoose, logoStatus, logoPreview, logoClear]),
+      el("div", { className: "reportit-logo-row" }, [footerAlign, el("label", { className: "reportit-option" }, [pageNumbers, textNode("Number pages (including cover)")]) ]));
+    const coverFields = el("details", { className: "reportit-document-options" }, [el("summary", { textContent: "Cover logos (optional)" })]);
+    for (const [index, label] of ["Company logo", "Client logo"].entries()) {
+      const input = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
+      const choose = el("button", { type: "button", className: "reportit-bulk", textContent: `Choose ${label.toLowerCase()}` });
+      const thumbnail = el("img", { className: "reportit-logo-preview", alt: label });
+      const remove = el("button", { type: "button", className: "reportit-bulk", textContent: "Remove", ariaLabel: `Remove ${label.toLowerCase()}` });
+      const sync = () => { thumbnail.hidden = remove.hidden = !coverLogos[index]; if (coverLogos[index]) thumbnail.src = coverLogos[index]; };
+      choose.addEventListener("click", () => input.click());
+      remove.addEventListener("click", () => { coverLogos[index] = ""; sync(); saveMemory(); });
+      input.addEventListener("change", () => {
+        const file = input.files?.[0]; input.value = "";
+        if (!file) return;
+        if (file.size > 512 * 1024 || !/^image\/(png|jpeg|webp|gif)$/.test(file.type)) { context.ui.notice("Choose a PNG, JPEG, WebP or GIF logo under 512 KB."); return; }
+        const reader = new FileReader();
+        reader.onload = () => { if (disposed) return; coverLogos[index] = String(reader.result || ""); sync(); saveMemory(); };
+        reader.onerror = () => context.ui.notice("Could not read that image.");
+        reader.readAsDataURL(file);
+      });
+      coverFields.append(el("div", { className: "reportit-logo-row" }, [input, choose, thumbnail, remove]));
+      sync();
+    }
     syncLogo();
     const pickList = el("div", { className: "reportit-list reportit-picklist" });
-    pickCol.append(pickList);
+    pickCol.append(el("h3", { className: "reportit-col-head reportit-selection-head", textContent: "Sections · drag to reorder" }), pickList, coverFields, footerFields);
     const generateBtn = el("button", { type: "button", className: "reportit-generate", textContent: "Generate report" });
     pickCol.append(generateBtn);
     const genNote = el("p", { className: "rp-note" });
@@ -901,8 +1080,8 @@ function mountSurface(context, { container }) {
         row.append(upBtn, downBtn, grip, el("span", { className: "reportit-pickrow-title", textContent: o.title }), el("span", { className: "reportit-pickrow-type", textContent: typeLabel(o.type) }), remove);
         pickList.append(row);
       });
-      if (!selectedIds.length) pickList.append(el("p", { className: "rp-note", textContent: "Tick objects on the left, or use “Add all matching”." }));
-      pickCount.textContent = `${selectedIds.length} of ${pool.length}`;
+      if (!selectedIds.length) pickList.append(el("p", { className: "rp-note", textContent: "Choose objects on the left, or select all filtered results." }));
+      pickCount.textContent = `${selectedIds.length} sections`;
       updateGenerateEnabled();
       saveMemory();
 
@@ -942,6 +1121,7 @@ function mountSurface(context, { container }) {
     editBtn.addEventListener("click", () => { previewWrap.hidden = true; builder.hidden = false; });
 
     printBtn.addEventListener("click", () => {
+      if (!preview.firstChild || printHost) return;
       if (typeof window.print !== "function") { context.ui.notice("Printing is not available in this host."); return; }
       // Chromium's Save-as-PDF names the file after `document.title` — point it
       // at the report title for this print, restore afterwards.
@@ -956,8 +1136,11 @@ function mountSurface(context, { container }) {
     });
 
     generateBtn.addEventListener("click", async () => {
+      if (!selectedIds.length || !titleInput.value.trim() || builder.inert) return;
       generateBtn.disabled = true;
+      builder.inert = true;
       genNote.textContent = "Building the report…";
+      try {
       const sections = selectedIds.map((id) => {
         const o = byId.get(id);
         return { title: o.title, type: typeLabel(o.type), blocks: normalizeHeadings(renderMarkdown(tiptapToMarkdown(o.content))) };
@@ -981,11 +1164,15 @@ function mountSurface(context, { container }) {
         description: descInput.value,
         dateText: formatDate(new Date()),
         sections,
-        footer: { note: footerNoteInput.value, logoUri: footerLogoUri },
+        footer: { note: footerNoteInput.value, logoUri: footerLogoUri, align: footerAlign.value, pageNumbers: pageNumbers.checked },
+        coverLogos,
       });
-      preview.replaceChildren(renderReport(model, result.uris));
+      const documentPages = await renderReport(model, result.uris, root);
+      if (disposed) return;
+      preview.replaceChildren(documentPages);
+      preview.scrollTop = 0;
 
-      const noteParts = [];
+      const noteParts = [`${documentPages.children.length} A4 pages · Print at 100% scale, A4, with browser headers and footers off.`];
       if (result.missing) noteParts.push(`${result.missing} of ${total} images could not be included`);
       if (result.budgetHit) noteParts.push("the report is over the image budget");
       if (result.missing && !result.budgetHit) noteParts.push("check “Let plugins read pasted images” in Settings → Files & links");
@@ -1000,8 +1187,12 @@ function mountSurface(context, { container }) {
 
       builder.hidden = true;
       previewWrap.hidden = false;
-      generateBtn.disabled = false;
       genNote.textContent = "";
+      } catch (cause) {
+        if (!disposed) genNote.textContent = `Could not prepare the report: ${String(cause?.message ?? cause)}`;
+      } finally {
+        if (!disposed) { builder.inert = false; updateGenerateEnabled(); }
+      }
     });
 
     renderPool();
@@ -1026,13 +1217,25 @@ function mountSurface(context, { container }) {
 // plugin-css-token-check exempts a `.rp-doc` scope for this plugin.
 const styles = `
 .reportit { color: var(--notible-text); font-size: 13px; }
+.reportit [hidden] { display: none !important; }
+.reportit-measure { position: fixed; left: -10000px; top: 0; visibility: hidden; width: 210mm; pointer-events: none; }
 .reportit-shell { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .rp-note { margin: 0; color: var(--notible-muted); font-size: 12px; line-height: 1.5; }
 
-.reportit-builder { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; min-height: 0; }
+.reportit-builder { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; min-height: 0; }
 @media (max-width: 900px) { .reportit-builder { grid-template-columns: 1fr; } }
 .reportit-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.reportit-col-head { margin: 0; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--notible-muted); }
+.reportit-col-head { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: var(--notible-text); }
+.reportit-selection-head { margin-top: 12px; }
+.reportit-select-all, .reportit-option { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+.reportit-select-all { padding: 10px 6px 6px; border-bottom: 1px solid var(--notible-border); }
+.reportit-type-filter, .reportit-document-options { font-size: 12px; }
+.reportit-type-filter summary, .reportit-document-options summary { cursor: pointer; padding: 8px 0; color: var(--notible-muted); }
+.reportit-type-filter { flex-basis: 100%; }
+.reportit-document-options { border-top: 1px solid var(--notible-border); margin-top: 8px; }
+.reportit-document-options .reportit-logo-row { margin: 8px 0; }
+.reportit input[type="checkbox"] { accent-color: var(--notible-accent); width: 15px; height: 15px; flex: none; }
+.reportit button:focus-visible, .reportit input:focus-visible, .reportit select:focus-visible, .reportit summary:focus-visible { outline: 2px solid var(--notible-accent); outline-offset: 2px; }
 .reportit-count { margin-left: 6px; color: var(--notible-faint); font-weight: 500; }
 .reportit-count:empty { display: none; }
 .reportit-bulkrow { display: flex; gap: 8px; }
@@ -1056,12 +1259,15 @@ const styles = `
 .reportit-chip[data-on="yes"] { border-color: var(--notible-accent); background: var(--notible-selected); color: var(--notible-accent); }
 .reportit-select, .reportit-search, .reportit-title-input, .reportit-desc-input { min-width: 0; border: 1px solid var(--notible-border); border-radius: 7px; background: var(--notible-surface); color: var(--notible-text); font: inherit; font-size: 12px; padding: 6px 9px; }
 .reportit-desc-input { resize: vertical; }
+.reportit-search { flex: 1 0 100%; box-sizing: border-box; height: 36px; }
+.reportit-filters > .reportit-select { flex: 1; height: 34px; }
+.reportit-title-input { min-height: 36px; box-sizing: border-box; }
 .reportit-list { display: flex; flex-direction: column; gap: 2px; max-height: 46vh; overflow-y: auto; border: 1px solid var(--notible-border-subtle, var(--notible-border)); border-radius: 8px; padding: 4px; }
-.reportit-poolrow { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; cursor: pointer; }
+.reportit-poolrow { display: flex; align-items: center; gap: 8px; padding: 9px 6px; border-radius: 6px; cursor: pointer; }
 .reportit-poolrow:hover { background: var(--notible-hover); }
 .reportit-poolrow-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reportit-poolrow-type, .reportit-pickrow-type { flex: none; color: var(--notible-faint); font-size: 11px; }
-.reportit-pickrow { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; background: transparent; }
+.reportit-pickrow { display: flex; align-items: center; gap: 8px; padding: 9px 6px; border-radius: 6px; background: transparent; }
 .reportit-pickrow:hover { background: var(--notible-hover); }
 /* The lifted card the pointer is carrying — opaque and raised, not dimmed,
    since it is now following the cursor rather than sitting in place while a
@@ -1082,23 +1288,31 @@ const styles = `
 .reportit-preview-bar { display: flex; gap: 10px; align-items: center; }
 /* No card here — the report sheet floats on the workspace background like the
    rest of the plugin chrome. Padding is just breathing room around the sheet. */
-.reportit-preview { padding: 24px 0; background: transparent; overflow: auto; max-height: 68vh; }
+.reportit-preview { padding: 12px; background: var(--notible-hover); overflow: auto; max-height: 72vh; }
 
 /* palette-exempt: the report is a fixed light document (black on white,
    always), not a themed surface — its colour literals are intentional and
    plugin-css-token-check skips this region. */
-.rp-doc { background: #fff; color: #1a1a1a; font-family: Georgia, "Times New Roman", serif; font-size: 11pt; line-height: 1.55; max-width: 210mm; margin: 0 auto; padding: 26mm 22mm; box-shadow: 0 1px 6px rgba(0, 0, 0, .12); }
+.rp-doc { color: #1a1a1a; font-family: Georgia, "Times New Roman", serif; font-size: 11pt; line-height: 1.55; width: 210mm; margin: 0 auto; padding: 0; text-align: left; }
+.rp-doc * { box-sizing: border-box; }
+.rp-page { position: relative; width: 210mm; height: 297mm; padding: 18mm 18mm 28mm; margin: 0 0 20px; background: #fff; box-shadow: 0 1px 6px rgba(0, 0, 0, .12); break-after: page; }
+.rp-page:last-child { break-after: auto; }
+.rp-page-content { display: flow-root; height: 251mm; overflow: visible; overflow-wrap: anywhere; }
+.rp-doc .rp-page-content > :first-child { margin-top: 0; }
 .rp-doc h1, .rp-doc h2, .rp-doc h3, .rp-doc h4, .rp-doc h5, .rp-doc h6 { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #111; line-height: 1.25; }
-.rp-cover { display: flex; flex-direction: column; justify-content: center; padding: 24px 0 32px; }
-.rp-title { font-size: 30pt; font-weight: 700; margin: 0 0 10px; }
+.rp-doc .rp-cover { display: flow-root; padding: 18mm 0 0; border-top: 2px solid #222; }
+.rp-doc .rp-cover-logos { display: flex; justify-content: space-between; align-items: center; gap: 16mm; margin-bottom: 32mm; }
+.rp-doc .rp-cover-logos img { max-width: 70mm; max-height: 25mm; object-fit: contain; }
+.rp-doc .rp-cover-eyebrow { font: 9pt system-ui, sans-serif; letter-spacing: .18em; color: #666; margin: 0 0 8mm; }
+.rp-doc .rp-title { font-size: 30pt; font-weight: 700; margin: 0 0 8mm; white-space: normal; overflow: visible; text-overflow: clip; height: auto; max-height: none; overflow-wrap: anywhere; }
 .rp-date { margin: 0 0 16px; color: #666; font-family: system-ui, sans-serif; font-size: 10pt; }
 .rp-desc { margin: 0; max-width: 60ch; color: #333; }
-.rp-toc { margin: 0 0 8px; }
-.rp-toc h2 { font-size: 15pt; margin: 0 0 8px; }
-.rp-toc ol { margin: 0; padding-left: 1.4em; color: #333; }
-.rp-toc li { margin: 2px 0; }
+.rp-doc .rp-toc-title { font-size: 22pt; margin: 0 0 10mm; }
+.rp-doc .rp-toc-entry { display: flex; align-items: baseline; gap: 4mm; font-size: 11pt; line-height: 1.65; margin: 0 0 4mm; }
+.rp-doc .rp-toc-number { min-width: 7mm; flex: none; color: #777; font: 9pt system-ui, sans-serif; font-variant-numeric: tabular-nums; }
 .rp-section { margin: 0; }
-.rp-section-title { font-size: 15pt; font-weight: 650; margin: 18px 0 0; }
+.rp-doc .rp-section-title { font-size: 18pt; font-weight: 650; margin: 0 0 3mm; white-space: normal; overflow: visible; text-overflow: clip; height: auto; max-height: none; overflow-wrap: anywhere; }
+.rp-doc .rp-section-head { margin-bottom: 8mm; }
 .rp-section-type { margin: 2px 0 10px; font-family: system-ui, sans-serif; font-size: 8pt; color: #888; text-transform: lowercase; }
 .rp-body h3 { font-size: 13pt; margin: 16px 0 4px; }
 .rp-body h4 { font-size: 11.5pt; margin: 14px 0 4px; }
@@ -1113,31 +1327,29 @@ const styles = `
 .rp-body pre { background: #f5f5f5; border: 1px solid #e2e2e2; border-radius: 4px; padding: 10px 12px; font: 9pt/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 12px; }
 .rp-body blockquote { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid #ccc; color: #444; }
 .rp-hl { background: #fff2a8; padding: 0 2px; }
-.rp-img { display: block; max-width: 100%; margin: 6px 0 12px; }
+.rp-img { display: block; max-width: 100%; max-height: 240mm; width: auto; height: auto; object-fit: contain; margin: 6px 0 12px; }
 .rp-img-missing { margin: 6px 0 12px; color: #999; font-style: italic; font-size: 10pt; }
 .rp-rule { border: 0; border-top: 1px solid #ccc; margin: 24px 0; }
 
-/* Optional running footer — repeats on every page in print (position: fixed) */
-.rp-footer { display: flex; align-items: center; gap: 10px; margin-top: 30px; padding-top: 10px; border-top: 1px solid #ddd; color: #777; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 8pt; }
+/* Each sheet owns its footer, outside its measured content area. */
+.rp-doc .rp-footer { position: absolute; left: 18mm; right: 18mm; bottom: 10mm; display: flex; align-items: center; gap: 6mm; padding-top: 3mm; border-top: 1px solid #ddd; color: #777; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 8pt; line-height: 1.3; }
+.rp-doc .rp-footer-branding { display: flex; align-items: center; gap: 3mm; min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.rp-doc .rp-footer[data-align="right"] .rp-footer-branding { justify-content: flex-end; text-align: right; }
+.rp-doc .rp-footer[data-align="left"] .rp-footer-branding { justify-content: flex-start; text-align: left; }
+.rp-doc .rp-page-number { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .rp-footer-logo { max-height: 11mm; max-width: 42mm; width: auto; object-fit: contain; }
-.rp-footer-note { margin-left: auto; text-align: right; }
+.rp-footer-note { min-width: 0; }
 
-/* margin:0 here is deliberate: it stops Chromium adding its own page
-   header/footer (the URL — "tauri.localhost" — the date and page numbers).
-   The paper margin is moved onto the .rp-doc padding below. */
+/* Physical margins are repeated INSIDE EVERY explicit A4 sheet. */
 @page { size: A4; margin: 0; }
 @media print {
   body > *:not(#rp-print-host) { display: none !important; }
+  html, body { margin: 0 !important; padding: 0 !important; width: auto !important; height: auto !important; overflow: visible !important; }
   #rp-print-host, #rp-print-host .rp-doc { display: block; }
-  .rp-doc { position: static; box-shadow: none; max-width: none; margin: 0; padding: 18mm 16mm 22mm; }
-  .rp-cover { min-height: 76vh; }   /* the cover owns its page on paper */
-  .rp-footer { position: fixed; left: 16mm; right: 16mm; bottom: 8mm; margin: 0; background: #fff; }
+  #rp-print-host { margin: 0; padding: 0; }
+  .rp-doc { margin: 0; padding: 0; }
+  .rp-page { margin: 0; box-shadow: none; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
 }
-.rp-cover, .rp-toc { break-after: page; }
-.rp-section-title, .rp-section-type { break-after: avoid; }
-.rp-section { break-inside: auto; }
-.rp-body h3, .rp-body h4, .rp-body h5, .rp-body h6 { break-after: avoid; }
-.rp-body pre, .rp-body blockquote { break-inside: avoid; }
 /* end palette-exempt */
 `;
 
@@ -1147,7 +1359,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.7",
+    version: "0.1.8",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",
@@ -1170,4 +1382,3 @@ export default {
     this._disposables = [];
   },
 };
-

@@ -180,9 +180,14 @@ assert.equal(model.sections[1].title, "Untitled");
 assert.equal(reportModel({}).cover.title, "Report", "an empty title falls back");
 
 // --- optional page footer
-assert.deepEqual(reportModel({}).footer, { note: "", logoUri: "" }, "no footer by default");
+assert.deepEqual(reportModel({}).footer, { note: "", logoUri: "", align: "right", pageNumbers: false }, "no footer by default");
 const footed = reportModel({ footer: { note: "  Confidential  ", logoUri: "data:image/png;base64,AAAA" } });
-assert.deepEqual(footed.footer, { note: "Confidential", logoUri: "data:image/png;base64,AAAA" });
+assert.deepEqual(footed.footer, { note: "Confidential", logoUri: "data:image/png;base64,AAAA", align: "right", pageNumbers: false });
+assert.equal(reportModel({ footer: { align: "left", pageNumbers: true } }).footer.pageNumbers, true);
+assert.equal(reportModel({ footer: { align: "left" } }).footer.align, "left");
+assert.equal(reportModel({ footer: { align: "invalid" } }).footer.align, "right");
+assert.deepEqual(reportModel({ coverLogos: ["https://remote/logo.png", "data:image/svg+xml;base64,AAAA"] }).cover.logos, []);
+assert.equal(reportModel({ coverLogos: Array(3).fill("data:image/png;base64,AAAA") }).cover.logos.length, 2);
 assert.equal(reportModel({ footer: { logoUri: "https://evil/logo.png" } }).footer.logoUri, "", "a non-data: logo URL is rejected");
 assert.equal(reportModel({ footer: { note: 5 } }).footer.note, "5");
 
@@ -196,7 +201,7 @@ assert.ok(/navIcon: "file-text"/.test(source), "the nav card uses the 1.14 file-
 assert.ok(source.includes("context.data.media.read"), "images come through the 1.14 media API");
 assert.ok(source.includes("@page") && source.includes("break-after: page"), "the print stylesheet sets A4 and page breaks");
 assert.ok(/@page\s*\{[^}]*margin:\s*0/.test(source), "the print page has margin:0 so Chromium adds no URL/date/page-number chrome");
-assert.ok(source.includes("rp-footer") && source.includes("position: fixed") && source.includes("FileReader"), "optional running footer: a note and a locally-read (FileReader, no upload) logo");
+assert.ok(source.includes("rp-footer") && source.includes("position: absolute") && source.includes("FileReader"), "each sheet owns its footer and locally-read logo");
 assert.ok(source.includes("window.print") && source.includes("afterprint"), "printing is window.print with an afterprint restore");
 assert.ok(source.includes('el("div", { id: "rp-print-host" })') || source.includes('id: "rp-print-host"'), "the document is reparented to a top-level host for printing");
 assert.ok(source.includes("IMAGE_BUDGET_BYTES") && source.includes("IMAGE_CONCURRENCY"), "image reads are bounded by a byte budget and a concurrency cap");
@@ -208,7 +213,7 @@ assert.ok(/let builderMemory = null;/.test(source) && source.includes("saveMemor
 
 // --- builder filters
 assert.ok(source.includes("filters.tag") && source.includes('"Any tag"') && source.includes("o.tags.includes(filters.tag)"), "the pool can be filtered by a props tag");
-assert.ok(source.includes("const matchesFilters =") && source.includes('textContent: "Add all matching"') && source.includes('textContent: "Clear selection"'), "bulk add of every filtered object, and clear");
+assert.ok(source.includes("const matchesFilters =") && source.includes("selectAll.indeterminate") && source.includes('textContent: "Clear selection"'), "tri-state selection of filtered objects, and clear");
 assert.ok(source.includes("readTags(o.props)"), "pool rows carry their tags, read from props");
 
 console.log("Notible ReportIt self-check passed.");
