@@ -511,6 +511,15 @@ function renderBlocks(blocks, dataUris) {
 /** `dataUris` also carries drawn diagrams, keyed by this prefix + source. */
 const DIAGRAM_KEY = "diagram:";
 
+/** Mermaid's markup is HTML-flavoured: a label with a line break carries an
+ *  unclosed `<br>`, which an <img> (strict XML) refuses, so the picture came
+ *  out broken. Parse it as HTML (DOMParser never runs scripts) and write it
+ *  back as XML. Core 0.91.1+ already returns XML; this keeps 0.91.0 working. */
+export function asXml(svg) {
+  const node = new DOMParser().parseFromString(svg, "text/html").body.querySelector("svg");
+  return node ? new XMLSerializer().serializeToString(node) : svg;
+}
+
 /** Mermaid blocks drawn as SVG by Core (API 1.20). An older Core, or a diagram
  *  that fails to draw, leaves the block as its source code. */
 async function drawDiagrams(context, sections, uris) {
@@ -519,7 +528,7 @@ async function drawDiagrams(context, sections, uris) {
   for (const source of new Set(sections.flatMap((s) => diagramSourcesIn(s.blocks)))) {
     try {
       const svg = await draw("mermaid", source, { mode: "paper" });
-      if (svg) uris.set(DIAGRAM_KEY + source, svg);
+      if (svg) uris.set(DIAGRAM_KEY + source, asXml(svg));
     } catch { /* syntax error: print the source instead */ }
   }
 }
@@ -1660,7 +1669,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.14",
+    version: "0.1.15",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",

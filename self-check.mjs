@@ -334,4 +334,5 @@ console.log("tables ok");
   assert.match(source, /renderCodeBlockSvg/, "report must draw diagrams through context.editor.renderCodeBlockSvg");
   assert.match(source, /typeof draw !== "function"\) return;/, "an older Core without the API must fall back to the source");
 }
+assert.match(source, /uris\.set\(DIAGRAM_KEY \+ source, asXml\(svg\)\)/, "Mermaid SVG must be rewritten as XML: an <img> refuses its unclosed <br> (0.1.14 printed a broken picture)");
 console.log("diagrams ok");
