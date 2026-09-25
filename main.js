@@ -169,16 +169,47 @@ export function tiptapToMarkdown(raw) {
   return doc.content.map((node) => nodeToMarkdown(node)).join("\n").trimEnd();
 }
 
+/**
+ * A note can carry an image in the middle of a line: "step 3 text![](media/…)",
+ * typed or pasted after text (older notes and synced ones do). Left in the line,
+ * the inline parser reduces it to its (empty) alt text and the screenshot
+ * vanishes from the report. Give every such image a line of its own, keeping the
+ * text before and after it. Fenced code and quotes (which recurse) are left alone.
+ */
+const INLINE_MEDIA_IMAGE = /!\[[^\]]*\]\(media\/[^)\s]+(?:\s+"[^"]*")?\)/g;
+export function splitInlineImages(lines) {
+  const out = [];
+  let fence = null;
+  for (const line of lines) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) { fence = fence === null ? marker[1][0] : fence === marker[1][0] ? null : fence; out.push(line); continue; }
+    if (fence !== null || /^\s*>/.test(line) || !line.includes("![")) { out.push(line); continue; }
+    let last = 0;
+    for (const m of line.matchAll(INLINE_MEDIA_IMAGE)) {
+      const before = line.slice(last, m.index);
+      if (before.trim()) out.push(before.trimEnd());
+      out.push(m[0]);
+      last = m.index + m[0].length;
+    }
+    if (last === 0) out.push(line);
+    else if (line.slice(last).trim()) out.push(line.slice(last).trim());
+  }
+  return out;
+}
+
 /** One markdown string → Block[]. Minimal by design: the constructs a note
  *  actually carries, everything else degrading to paragraph text rather than
  *  throwing. */
 export function renderMarkdown(md) {
-  const lines = String(md ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const lines = splitInlineImages(String(md ?? "").replace(/\r\n?/g, "\n").split("\n"));
   const blocks = [];
   let i = 0;
 
   const isBlank = (s) => s.trim() === "";
   const listMatch = (s) => s.match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
+  // Cells split on unescaped pipes; the outer pipes are optional.
+  const cellsOf = (s) => s.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+  const tableStart = (k) => lines[k].includes("|") && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(lines[k + 1] ?? "") && (lines[k + 1] ?? "").includes("|");
 
   while (i < lines.length) {
     let line = lines[i];
@@ -222,6 +253,21 @@ export function renderMarkdown(md) {
       continue;
     }
 
+    // GFM table — a header row, a `| --- |` separator, then body rows
+    if (tableStart(i)) {
+      const align = cellsOf(lines[i + 1]).map((c) => c.endsWith(":") ? (c.startsWith(":") ? "center" : "right") : "left");
+      const head = cellsOf(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && !isBlank(lines[i]) && lines[i].includes("|")) {
+        const cells = cellsOf(lines[i]);
+        rows.push(head.map((_, c) => parseInline(cells[c] ?? "")));
+        i += 1;
+      }
+      blocks.push({ kind: "table", align: head.map((_, c) => align[c] ?? "left"), head: head.map((c) => parseInline(c)), rows });
+      continue;
+    }
+
     // list — consume the run; nesting by indent (one level deep is enough for
     // a note; deeper indent items are folded into the nearest list)
     if (listMatch(line)) {
@@ -247,7 +293,7 @@ export function renderMarkdown(md) {
         items.push({ inline: parseInline(content), checked });
         i += 1;
       }
-      blocks.push({ kind: "list", ordered, items });
+      blocks.push({ kind: "list", ordered, items, start: ordered ? Number.parseInt(first[2], 10) || 1 : 1 });
       continue;
     }
 
@@ -258,7 +304,7 @@ export function renderMarkdown(md) {
     const standaloneImage = (s) => /^!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\)$/.test(s.trim());
     const startsBlock = (s) => isBlank(s) || /^(#{1,6}\s|\s*>|\s*(`{3,}|~{3,}))/.test(s) || !!listMatch(s) || /^\s*([-*_])(\s*\1){2,}\s*$/.test(s) || standaloneImage(s);
     const para = [];
-    while (i < lines.length && !startsBlock(lines[i])) {
+    while (i < lines.length && !startsBlock(lines[i]) && !tableStart(i)) {
       para.push(lines[i].trim());
       i += 1;
     }
@@ -383,6 +429,8 @@ function renderBlocks(blocks, dataUris) {
       frag.append(p);
     } else if (block.kind === "list") {
       const listEl = document.createElement(block.ordered ? "ol" : "ul");
+      // A list split by a screenshot continues its numbering instead of restarting at 1.
+      if (block.ordered && block.start > 1) listEl.start = block.start;
       for (const item of block.items ?? []) {
         const li = document.createElement("li");
         if (item.checked !== null && item.checked !== undefined) {
@@ -404,6 +452,16 @@ function renderBlocks(blocks, dataUris) {
       const bq = document.createElement("blockquote");
       bq.append(renderBlocks(block.blocks, dataUris));
       frag.append(bq);
+    } else if (block.kind === "table") {
+      const row = (cells, tag) => el("tr", {}, cells.map((inline, c) => {
+        const cell = el(tag, {}, [renderInline(inline)]);
+        if (block.align?.[c] && block.align[c] !== "left") cell.style.textAlign = block.align[c];
+        return cell;
+      }));
+      frag.append(el("table", { className: "rp-table" }, [
+        el("thead", {}, [row(block.head ?? [], "th")]),
+        el("tbody", {}, (block.rows ?? []).map((cells) => row(cells, "td"))),
+      ]));
     } else if (block.kind === "hr") {
       frag.append(document.createElement("hr"));
     } else if (block.kind === "image") {
@@ -568,6 +626,17 @@ async function renderReport(model, dataUris, measurementHost) {
           const list = block.cloneNode(false);
           if (block.tagName === "OL") list.start = (block.start || 1) + itemIndex;
           list.append(item); flow(list);
+        }
+      } else if (block.tagName === "TABLE" && block.tBodies[0]?.rows.length) {
+        // Row by row; a table that runs onto the next sheet repeats its header there.
+        const fresh = () => el("table", { className: block.className }, [block.tHead.cloneNode(true), document.createElement("tbody")]);
+        let table = null;
+        for (const row of [...block.tBodies[0].rows]) {
+          if (table) { table.tBodies[0].append(row); if (fits()) continue; row.remove(); }
+          table = fresh();
+          table.tBodies[0].append(row);
+          // ponytail: a single row taller than a sheet is not split; it overflows that sheet.
+          if (!place(table)) { newPage("case"); content.append(table); }
         }
       } else flow(block);
     };
@@ -1511,6 +1580,9 @@ const styles = `
 .rp-body pre { background: #f5f5f5; border: 1px solid #e2e2e2; border-radius: 4px; padding: 10px 12px; font: 9pt/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 12px; }
 .rp-body blockquote { margin: 0 0 12px; padding-left: 12px; border-left: 3px solid #ccc; color: #444; }
 .rp-hl { background: #fff2a8; padding: 0 2px; }
+.rp-table { width: 100%; border-collapse: collapse; margin: 0 0 12px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 9.5pt; }
+.rp-table th, .rp-table td { padding: 5px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; border-bottom: 1px solid #e2e2e2; }
+.rp-table th { font-weight: 600; border-bottom: 1.5px solid #999; }
 .rp-img { display: block; max-width: 100%; max-height: 240mm; width: auto; height: auto; object-fit: contain; margin: 6px 0 12px; }
 .rp-img-missing { margin: 6px 0 12px; color: #999; font-style: italic; font-size: 10pt; }
 .rp-rule { border: 0; border-top: 1px solid #ccc; margin: 24px 0; }
@@ -1543,7 +1615,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.11",
+    version: "0.1.13",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",

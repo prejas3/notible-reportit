@@ -16,6 +16,7 @@ import plugin, {
   normalizeHeadings,
   parseInline,
   renderMarkdown,
+  splitInlineImages,
   reportModel,
   tiptapToMarkdown,
 } from "./main.js";
@@ -266,4 +267,60 @@ assert.ok(source.includes('id: `rp-section-${index}`'), "each section heading ca
 assert.ok(source.includes("propertyCatalog.filter((p) => selectedIds.some((id) => propertyValuesById.get(id)?.[p.key] !== undefined))"), "the properties picker only offers keys present on a currently selected note");
 assert.ok(source.includes("showType.checked ? typeLabel(o.type) : \"\""), "the note-type line is optional, off hides it entirely rather than printing a blank");
 
+// --- a screenshot at the END of a text line (or of a numbered step) must still reach the report.
+// This is the shape of a real note: a legacy Tiptap document whose step text ends in "![](media/…)".
+{
+  const ref = (n) => `media/${n}0000000-0000-4000-8000-000000000000.png`;
+  const doc = JSON.stringify({ type: "doc", content: [
+    { type: "paragraph", content: [{ type: "text", text: "3. We'll perform the steps" + "![](" + ref(1) + ")" }] },
+    { type: "paragraph", content: [{ type: "text", text: "4. About 11:12 a timeout" + "![](" + ref(2) + ")" }] },
+    { type: "paragraph", content: [{ type: "text", text: "plain ![](" + ref(3) + ") tail text" }] },
+  ] });
+  const blocks = renderMarkdown(tiptapToMarkdown(doc));
+  assert.deepEqual(mediaRefsIn(blocks), [ref(1), ref(2), ref(3)], "every mid-line screenshot is collected for loading");
+  assert.equal(blocks.filter((b) => b.kind === "image").length, 3, "each becomes its own image block");
+  const second = blocks.find((b) => b.kind === "list" && b.start === 4);
+  assert.ok(second, "a list split by a screenshot keeps its own number (4.), not restart at 1");
+  const tail = blocks[blocks.length - 1];
+  assert.equal(tail.kind, "para", "text after an inline image is kept as its own paragraph");
+  assert.equal(tail.inline.map((x) => x.text).join(""), "tail text");
+  // every list dialect and placement keeps its screenshots
+  const shot = (n) => "![](" + ref(n) + ")";
+  const shapes = [
+    ["- one " + shot(1) + "\n- two " + shot(2), 2],
+    ["* a " + shot(1) + "\n+ b " + shot(2), 2],
+    ["- [ ] a " + shot(1) + "\n- [x] b " + shot(2), 2],
+    ["- a\n" + shot(1) + "\n- b", 1],
+    ["1. a\n   " + shot(1) + "\n2. b", 1],
+    ["- a\n  " + shot(1) + "\n- b", 1],
+    ["- a\n  - b " + shot(1) + "\n  - c " + shot(2), 2],
+    ["- x " + shot(1) + " y " + shot(2) + " z", 2],
+    ["## Title " + shot(1), 1],
+    ["> quoted " + shot(1) + "\n> more " + shot(2), 2],
+  ];
+  for (const [md, want] of shapes) assert.equal(mediaRefsIn(renderMarkdown(md)).length, want, "screenshots kept in: " + JSON.stringify(md));
+  // code fences and quotes are not rewritten
+  assert.deepEqual(splitInlineImages(["```", "x ![](" + ref(1) + ") y", "```"]), ["```", "x ![](" + ref(1) + ") y", "```"]);
+  assert.deepEqual(splitInlineImages(["> a ![](" + ref(1) + ")"]), ["> a ![](" + ref(1) + ")"]);
+  // external images are untouched (never fetched anyway)
+  assert.deepEqual(splitInlineImages(["a ![](https://x/y.png) b"]), ["a ![](https://x/y.png) b"]);
+}
+
 console.log("Notible ReportIt self-check passed.");
+
+// --- GFM tables (legacy Tiptap notes store each row as its own paragraph)
+{
+  const md = tiptapToMarkdown(JSON.stringify({ type: "doc", content: [
+    "Intro text.", "| load_id | pick_stop_id | drop |", "| --- | ---: | :---: |", "| 959190 | 1681839 | **x** |", "| 959321 | a \\| b |",
+  ].map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })) }));
+  const blocks = renderMarkdown(md);
+  assert.deepEqual(blocks.map((b) => b.kind), ["para", "table"], "a table right under a paragraph is its own block");
+  const table = blocks[1];
+  assert.deepEqual(table.align, ["left", "right", "center"]);
+  assert.deepEqual(table.head.map((c) => c[0].text), ["load_id", "pick_stop_id", "drop"]);
+  assert.equal(table.rows.length, 2);
+  assert.deepEqual(table.rows[0][2], [{ kind: "strong", text: "x" }]);
+  assert.deepEqual(table.rows[1].map((c) => c[0].text), ["959321", "a | b", ""], "escaped pipe stays in the cell; short rows pad");
+  assert.deepEqual(renderMarkdown("a\n---\nb").map((b) => b.kind), ["para", "hr", "para"], "a bare --- is still a rule, not a table");
+}
+console.log("tables ok");
