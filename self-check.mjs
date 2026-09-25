@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import plugin, {
   buildTocModel,
+  diagramSourcesIn,
   collectProperties,
   mediaRefsIn,
   mimeForExt,
@@ -324,3 +325,13 @@ console.log("Notible ReportIt self-check passed.");
   assert.deepEqual(renderMarkdown("a\n---\nb").map((b) => b.kind), ["para", "hr", "para"], "a bare --- is still a rule, not a table");
 }
 console.log("tables ok");
+
+// --- Mermaid blocks keep their language; their sources are collected for drawing (API 1.20)
+{
+  const blocks = renderMarkdown(["```mermaid", "flowchart LR", "  A --> B", "```", "", "```js", "x()", "```", "", "> ```mermaid", "> pie", "> ```"].join(String.fromCharCode(10)));
+  assert.deepEqual(blocks.map((b) => b.lang ?? null), ["mermaid", "js", null]);
+  assert.deepEqual(diagramSourcesIn(blocks), ["flowchart LR" + String.fromCharCode(10) + "  A --> B", "pie"]);
+  assert.match(source, /renderCodeBlockSvg/, "report must draw diagrams through context.editor.renderCodeBlockSvg");
+  assert.match(source, /typeof draw !== "function"\) return;/, "an older Core without the API must fall back to the source");
+}
+console.log("diagrams ok");

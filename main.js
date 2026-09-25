@@ -24,7 +24,7 @@
 //   | { kind: "heading", level: 1..6, inline: Inline[] }
 //   | { kind: "para", inline: Inline[] }
 //   | { kind: "list", ordered: boolean, items: ListItem[] }
-//   | { kind: "code", text: string }
+//   | { kind: "code", text: string, lang?: string }
 //   | { kind: "quote", blocks: Block[] }
 //   | { kind: "hr" }
 //   | { kind: "image", src: string, alt: string }
@@ -227,7 +227,8 @@ export function renderMarkdown(md) {
         i += 1;
       }
       i += 1; // closing fence (or EOF)
-      blocks.push({ kind: "code", text: body.join("\n") });
+      const lang = line.trim().slice(fence[1].length).trim().split(/\s+/)[0].toLowerCase();
+      blocks.push({ kind: "code", text: body.join("\n"), ...(lang ? { lang } : {}) });
       continue;
     }
 
@@ -344,6 +345,19 @@ export function mediaRefsIn(blocks) {
   return [...seen];
 }
 
+/** Every distinct ```mermaid source in the tree, to draw before layout. */
+export function diagramSourcesIn(blocks) {
+  const seen = new Set();
+  const walk = (list) => {
+    for (const block of list) {
+      if (block.kind === "code" && block.lang === "mermaid" && block.text.trim()) seen.add(block.text);
+      else if (block.kind === "quote") walk(block.blocks);
+    }
+  };
+  walk(Array.isArray(blocks) ? blocks : []);
+  return [...seen];
+}
+
 /** The table of contents is section titles, in order — no page numbers (the
  *  print engine cannot tell us where pages land). */
 export function buildTocModel(sectionTitles) {
@@ -444,6 +458,15 @@ function renderBlocks(blocks, dataUris) {
         listEl.append(li);
       }
       frag.append(listEl);
+    } else if (block.kind === "code" && dataUris?.get?.(DIAGRAM_KEY + block.text)) {
+      // Drawn by Core before layout (see drawDiagrams). As an <img>, never
+      // parsed into the page: nothing inside the SVG can run.
+      const svg = dataUris.get(DIAGRAM_KEY + block.text);
+      const img = el("img", { className: "rp-diagram", alt: "Diagram" });
+      const width = Number(svg.match(/viewBox="[\d.-]+ [\d.-]+ ([\d.]+) /)?.[1]);
+      if (width > 0) img.style.width = `${width}px`;
+      img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      frag.append(img);
     } else if (block.kind === "code") {
       const pre = document.createElement("pre");
       pre.textContent = String(block.text ?? "");
@@ -483,6 +506,22 @@ function renderBlocks(blocks, dataUris) {
     }
   }
   return frag;
+}
+
+/** `dataUris` also carries drawn diagrams, keyed by this prefix + source. */
+const DIAGRAM_KEY = "diagram:";
+
+/** Mermaid blocks drawn as SVG by Core (API 1.20). An older Core, or a diagram
+ *  that fails to draw, leaves the block as its source code. */
+async function drawDiagrams(context, sections, uris) {
+  const draw = context.editor?.renderCodeBlockSvg;
+  if (typeof draw !== "function") return;
+  for (const source of new Set(sections.flatMap((s) => diagramSourcesIn(s.blocks)))) {
+    try {
+      const svg = await draw("mermaid", source, { mode: "paper" });
+      if (svg) uris.set(DIAGRAM_KEY + source, svg);
+    } catch { /* syntax error: print the source instead */ }
+  }
 }
 
 /** The model + resolved image data URIs → the `<article class="rp-doc">`. */
@@ -627,6 +666,9 @@ async function renderReport(model, dataUris, measurementHost) {
           if (block.tagName === "OL") list.start = (block.start || 1) + itemIndex;
           list.append(item); flow(list);
         }
+      } else if (block.classList?.contains("rp-diagram")) {
+        // A picture, not text: never split; CSS caps its height to one sheet.
+        if (!place(block)) { newPage("case"); content.append(block); }
       } else if (block.tagName === "TABLE" && block.tBodies[0]?.rows.length) {
         // Row by row; a table that runs onto the next sheet repeats its header there.
         const fresh = () => el("table", { className: block.className }, [block.tHead.cloneNode(true), document.createElement("tbody")]);
@@ -1400,6 +1442,8 @@ function mountSurface(context, { container }) {
         );
       }
       if (disposed) return;
+      await drawDiagrams(context, sections, result.uris);
+      if (disposed) return;
 
       const model = reportModel({
         title: titleInput.value,
@@ -1584,6 +1628,7 @@ const styles = `
 .rp-table th, .rp-table td { padding: 5px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; border-bottom: 1px solid #e2e2e2; }
 .rp-table th { font-weight: 600; border-bottom: 1.5px solid #999; }
 .rp-img { display: block; max-width: 100%; max-height: 240mm; width: auto; height: auto; object-fit: contain; margin: 6px 0 12px; }
+.rp-diagram { display: block; margin: 6px auto 12px; max-width: 100%; max-height: 230mm; height: auto; object-fit: contain; }
 .rp-img-missing { margin: 6px 0 12px; color: #999; font-style: italic; font-size: 10pt; }
 .rp-rule { border: 0; border-top: 1px solid #ccc; margin: 24px 0; }
 
@@ -1615,7 +1660,7 @@ export default {
   manifest: {
     id: "notible.reportit",
     name: "ReportIt",
-    version: "0.1.13",
+    version: "0.1.14",
     apiVersion: "1.14",
     description: "Assemble chosen notes, issues and tasks — any types, any order — into one uniform report with a title you set, and print it to PDF. It never changes your notes: it lays out their titles and bodies as a coherent document with a cover, a table of contents and consistent typography. For a client or a manager, not a raw export.",
     author: "Notible",
